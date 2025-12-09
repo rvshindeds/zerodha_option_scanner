@@ -1,125 +1,157 @@
-import numpy as np
 import pandas as pd
+import numpy as np
 
 
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+# =========================================================
+# RSI
+# =========================================================
+def compute_rsi(df: pd.DataFrame, period: int = 14):
     """
-    RSI using EMA smoothing.
-    Returns a Series aligned with close index.
+    Compute RSI using ONLY the close series.
+    Returns the latest RSI value as float, or None if unavailable.
+
+    This avoids errors caused by including datetime columns in diff().
     """
+    if df is None or df.empty:
+        return None
+
+    if "close" not in df.columns:
+        return None
+
+    close = pd.to_numeric(df["close"], errors="coerce").dropna()
+
+    if len(close) < period + 2:
+        return None
+
     delta = close.diff()
 
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    # Wilder-style smoothing (EMA with alpha=1/period)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    # Avoid divide-by-zero
+    avg_loss = avg_loss.replace(0, np.nan)
+
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
 
-    return rsi
+    latest = rsi.iloc[-1]
+    return float(latest) if pd.notna(latest) else None
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+# =========================================================
+# ATR (used by Supertrend)
+# =========================================================
+def _compute_atr(df: pd.DataFrame, period: int = 10) -> pd.Series:
     """
-    ATR using EMA smoothing.
-    df must contain: high, low, close
+    Compute ATR from OHLC.
     """
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
 
     prev_close = close.shift(1)
 
     tr = pd.concat(
         [
-            (high - low),
+            (high - low).abs(),
             (high - prev_close).abs(),
             (low - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
     return atr
 
 
-def compute_supertrend(
-    df: pd.DataFrame,
-    period: int = 10,
-    multiplier: float = 3.0
-) -> pd.DataFrame:
+# =========================================================
+# Supertrend (string output)
+# =========================================================
+def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
     """
-    Supertrend calculation.
-    Adds:
-      - supertrend
-      - st_direction (1 = Up, -1 = Down)
+    Compute Supertrend direction and return ONLY:
+    'Up' or 'Down'
 
-    df must contain: open, high, low, close
+    This function is intentionally designed to return a clean string
+    so scanner logic never receives a DataFrame/Series unexpectedly.
     """
-    df = df.copy()
+    st_df = compute_supertrend_df(df, period=period, multiplier=multiplier)
 
-    atr = compute_atr(df, period)
-    hl2 = (df["high"] + df["low"]) / 2.0
+    if st_df is None or st_df.empty or "in_uptrend" not in st_df.columns:
+        return "Unknown"
+
+    last_val = st_df["in_uptrend"].dropna()
+    if last_val.empty:
+        return "Unknown"
+
+    return "Up" if bool(last_val.iloc[-1]) else "Down"
+
+
+def compute_supertrend_df(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
+    """
+    Full Supertrend calculation returning a DataFrame.
+
+    Columns:
+    - upperband
+    - lowerband
+    - in_uptrend
+
+    You can use this for debugging if you ever want.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required = {"high", "low", "close"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    data = df.copy()
+
+    # Ensure numeric
+    data["high"] = pd.to_numeric(data["high"], errors="coerce")
+    data["low"] = pd.to_numeric(data["low"], errors="coerce")
+    data["close"] = pd.to_numeric(data["close"], errors="coerce")
+
+    data = data.dropna(subset=["high", "low", "close"])
+    if len(data) < period + 2:
+        return pd.DataFrame()
+
+    hl2 = (data["high"] + data["low"]) / 2.0
+    atr = _compute_atr(data, period=period)
 
     upperband = hl2 + (multiplier * atr)
     lowerband = hl2 - (multiplier * atr)
 
-    final_upper = upperband.copy()
-    final_lower = lowerband.copy()
+    in_uptrend = [True] * len(data)
 
-    # Build final bands
-    for i in range(1, len(df)):
-        if (
-            upperband.iloc[i] < final_upper.iloc[i - 1]
-            or df["close"].iloc[i - 1] > final_upper.iloc[i - 1]
-        ):
-            final_upper.iloc[i] = upperband.iloc[i]
+    # Convert to numpy-friendly indexing
+    close = data["close"].values
+    ub = upperband.values
+    lb = lowerband.values
+
+    for i in range(1, len(data)):
+        # Trend switch rules
+        if close[i] > ub[i - 1]:
+            in_uptrend[i] = True
+        elif close[i] < lb[i - 1]:
+            in_uptrend[i] = False
         else:
-            final_upper.iloc[i] = final_upper.iloc[i - 1]
+            in_uptrend[i] = in_uptrend[i - 1]
 
-        if (
-            lowerband.iloc[i] > final_lower.iloc[i - 1]
-            or df["close"].iloc[i - 1] < final_lower.iloc[i - 1]
-        ):
-            final_lower.iloc[i] = lowerband.iloc[i]
-        else:
-            final_lower.iloc[i] = final_lower.iloc[i - 1]
+            # Band adjustment rules
+            if in_uptrend[i] and lb[i] < lb[i - 1]:
+                lb[i] = lb[i - 1]
 
-    supertrend = pd.Series(index=df.index, dtype="float64")
-    direction = pd.Series(index=df.index, dtype="int64")
+            if not in_uptrend[i] and ub[i] > ub[i - 1]:
+                ub[i] = ub[i - 1]
 
-    supertrend.iloc[0] = np.nan
-    direction.iloc[0] = 1
+    out = pd.DataFrame(index=data.index)
+    out["upperband"] = ub
+    out["lowerband"] = lb
+    out["in_uptrend"] = in_uptrend
 
-    # Assign trend
-    for i in range(1, len(df)):
-        close = df["close"].iloc[i]
-        prev_dir = direction.iloc[i - 1]
-
-        if prev_dir == 1:
-            if close <= final_upper.iloc[i]:
-                direction.iloc[i] = -1
-                supertrend.iloc[i] = final_upper.iloc[i]
-            else:
-                direction.iloc[i] = 1
-                supertrend.iloc[i] = final_lower.iloc[i]
-        else:
-            if close >= final_lower.iloc[i]:
-                direction.iloc[i] = 1
-                supertrend.iloc[i] = final_lower.iloc[i]
-            else:
-                direction.iloc[i] = -1
-                supertrend.iloc[i] = final_upper.iloc[i]
-
-        # Safety fallback
-        if pd.isna(supertrend.iloc[i]):
-            supertrend.iloc[i] = (
-                final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
-            )
-
-    df["supertrend"] = supertrend
-    df["st_direction"] = direction
-
-    return df
+    return out.reset_index(drop=True)
