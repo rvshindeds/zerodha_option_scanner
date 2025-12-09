@@ -1,8 +1,25 @@
-.venv/
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets
 .env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit cache
 .streamlit/
+
+# Exports
 *.csv
 *.xlsx
-start_scanner.bat
-start_scanner.vbs

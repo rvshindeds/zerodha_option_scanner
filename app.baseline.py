@@ -32,6 +32,7 @@ API_SECRET = os.getenv("KITE_API_SECRET", "")
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Missing KITE_API_KEY or KITE_API_SECRET in .env")
 
+
 # =========================================================
 # Kite
 # =========================================================
@@ -39,7 +40,7 @@ kite = KiteConnect(api_key=API_KEY)
 login_url = kite.login_url()
 
 # =========================================================
-# Defaults
+# Defaults (production)
 # =========================================================
 DEFAULTS = {
     "interval": "15minute",
@@ -61,7 +62,8 @@ DEFAULTS = {
 # =========================================================
 def get_instruments_cached(force_refresh: bool = False) -> pd.DataFrame:
     """
-    Cache NFO instruments in session_state.
+    Cache NFO instruments in session_state for speed/stability.
+    Refresh every 60 minutes unless forced.
     """
     now = time.time()
     cache = st.session_state.get("instruments_cache")
@@ -81,22 +83,24 @@ h1, h2 = st.columns([3, 1])
 
 with h1:
     st.title("Options Signal Scanner")
-    st.caption("Signals using RSI + Supertrend + Option Price Δ & OI Δ with 2-layer interpretation.")
+    st.caption("Trade Ideas powered by RSI + Supertrend + option OI/Price behavior.")
 
 with h2:
     session_active = bool(st.session_state.get("access_token"))
     st.markdown("✅ **Session Active**" if session_active else "⚠️ **Not Logged In**")
+
     refresh_clicked = st.button("Refresh instruments", use_container_width=True)
 
 st.divider()
 
+
 # =========================================================
-# Login (safe)
+# Login (compact + safe)
 # =========================================================
 with st.expander("Login (required daily)", expanded=not session_active):
     st.markdown(f"[Login to Zerodha]({login_url})")
 
-    # ✅ Safe clear mechanism BEFORE widget is created
+    # ✅ Safe clear mechanism (pre-widget)
     if st.session_state.get("clear_request_token"):
         st.session_state["request_token_input"] = ""
         st.session_state["clear_request_token"] = False
@@ -125,7 +129,10 @@ with st.expander("Login (required daily)", expanded=not session_active):
                         st.error("No access_token received.")
                     else:
                         st.session_state["access_token"] = access_token
+
+                        # ✅ Set flag instead of mutating widget state directly
                         st.session_state["clear_request_token"] = True
+
                         st.success("Session generated for this app session.")
                         st.rerun()
 
@@ -138,6 +145,7 @@ with st.expander("Login (required daily)", expanded=not session_active):
             "Nothing is written to disk."
         )
 
+
 # Must have access token to scan
 if not st.session_state.get("access_token"):
     st.warning("Login first to enable scanning.")
@@ -145,7 +153,8 @@ if not st.session_state.get("access_token"):
 
 kite.set_access_token(st.session_state["access_token"])
 
-# Refresh instruments if clicked
+
+# Refresh instruments if user clicked button
 if refresh_clicked:
     try:
         _ = get_instruments_cached(force_refresh=True)
@@ -153,16 +162,17 @@ if refresh_clicked:
     except Exception as e:
         st.error(f"Instrument refresh failed: {e}")
 
+
 # =========================================================
 # Main Layout
 # =========================================================
 left, right = st.columns([1, 2.2], gap="large")
 
 # =========================
-# LEFT: Controls
+# LEFT: Quick Controls
 # =========================
 with left:
-    st.subheader("Controls")
+    st.subheader("Quick Controls")
 
     underlying = st.selectbox("Underlying", ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"])
 
@@ -184,7 +194,7 @@ with left:
     use_atm_filter = st.checkbox("ATM ± X filter", value=DEFAULTS["use_atm_filter"])
     atm_steps = st.number_input("X strike steps", min_value=1, max_value=50, value=DEFAULTS["atm_steps"])
 
-    st.markdown("### Confidence Filter")
+    st.markdown("### Signal Filter")
     min_conf = st.slider("Min confidence", 0, 100, DEFAULTS["min_conf"], 5)
 
     show_all_rows = st.checkbox("Show all scanned rows", value=DEFAULTS["show_all_rows"])
@@ -192,22 +202,34 @@ with left:
     run_scan = st.button("Run Scan", use_container_width=True)
 
     with st.expander("Advanced", expanded=False):
-        lookback_days = st.number_input("Lookback days", 2, 15, DEFAULTS["lookback_days"])
-        rsi_period = st.number_input("RSI period", 5, 50, DEFAULTS["rsi_period"])
-        rsi_threshold = st.number_input("RSI threshold", 50.0, 90.0, DEFAULTS["rsi_threshold"])
-        st_period = st.number_input("Supertrend period", 5, 50, DEFAULTS["st_period"])
-        st_mult = st.number_input("Supertrend multiplier", 1.0, 6.0, DEFAULTS["st_mult"], step=0.5)
+        lookback_days = st.number_input(
+            "Lookback days", min_value=2, max_value=15, value=DEFAULTS["lookback_days"]
+        )
+        rsi_period = st.number_input(
+            "RSI period", min_value=5, max_value=50, value=DEFAULTS["rsi_period"]
+        )
+        rsi_threshold = st.number_input(
+            "RSI threshold", min_value=50.0, max_value=90.0, value=DEFAULTS["rsi_threshold"]
+        )
+        st_period = st.number_input(
+            "Supertrend period", min_value=5, max_value=50, value=DEFAULTS["st_period"]
+        )
+        st_mult = st.number_input(
+            "Supertrend multiplier", min_value=1.0, max_value=6.0,
+            value=DEFAULTS["st_mult"], step=0.5
+        )
 
         diagnostic_fallback = st.checkbox(
             "If no trade ideas, show diagnostic table",
-            value=DEFAULTS["diagnostic_fallback"],
-        )
-        show_atm_details = st.checkbox(
-            "Show ATM detection details",
-            value=DEFAULTS["show_atm_details"],
+            value=DEFAULTS["diagnostic_fallback"]
         )
 
-# Defaults if Advanced not opened
+        show_atm_details = st.checkbox(
+            "Show ATM detection details",
+            value=DEFAULTS["show_atm_details"]
+        )
+
+# If Advanced was never opened, ensure variables exist with defaults
 if "lookback_days" not in locals():
     lookback_days = DEFAULTS["lookback_days"]
 if "rsi_period" not in locals():
@@ -230,23 +252,26 @@ if "show_atm_details" not in locals():
 with right:
     st.subheader("Trade Ideas")
 
-    # ATM transparency block
+    # Optional ATM detail banner (only when enabled)
     if show_atm_details and expiry_date:
         try:
             atm_ctx = get_atm_context(
                 kite, instruments_df, underlying, expiry_date, int(atm_steps)
             )
-
             b1, b2, b3, b4 = st.columns(4)
 
             spot_val = atm_ctx.get("spot")
             step_val = atm_ctx.get("step")
             atm_val = atm_ctx.get("atm")
 
-            b1.metric("Spot", f"{spot_val:.2f}" if spot_val else "N/A")
-            b2.metric("Strike Step", f"{step_val:.0f}" if step_val else "N/A")
-            b3.metric("Computed ATM", f"{atm_val:.0f}" if atm_val else "N/A")
-            b4.metric("Contracts in Expiry", str(atm_ctx.get("count", 0)))
+            with b1:
+                st.metric("Spot", f"{spot_val:.2f}" if spot_val else "N/A")
+            with b2:
+                st.metric("Strike Step", f"{step_val:.0f}" if step_val else "N/A")
+            with b3:
+                st.metric("Computed ATM", f"{atm_val:.0f}" if atm_val else "N/A")
+            with b4:
+                st.metric("Contracts in Expiry", str(atm_ctx.get("count", 0)))
 
             low = atm_ctx.get("low")
             high = atm_ctx.get("high")
@@ -281,7 +306,7 @@ with right:
             st.stop()
 
         # ---------------------------
-        # Filter ideas
+        # Ideas filter + confidence
         # ---------------------------
         ideas = result.copy()
         if "Action" in ideas.columns:
@@ -290,7 +315,7 @@ with right:
             ideas = ideas[ideas["Action Confidence"] >= int(min_conf)]
 
         # ---------------------------
-        # Action summary (top bar)
+        # Action breakdown bar
         # ---------------------------
         counts = ideas["Action"].value_counts().to_dict() if (not ideas.empty and "Action" in ideas.columns) else {}
 
@@ -300,41 +325,15 @@ with right:
         c3.metric("BUY PUT", counts.get("BUY PUT", 0))
         c4.metric("SELL PUT", counts.get("SELL PUT", 0))
 
-        # =========================================================
-        # ✅ NEW: Compact “Action Summary by OI Read”
-        # =========================================================
-        if "OI Read" in result.columns and "Action" in result.columns:
-            summary = (
-                result.groupby(["OI Read", "Action"])
-                .size()
-                .reset_index(name="Count")
-            )
-
-            pivot = summary.pivot_table(
-                index="OI Read",
-                columns="Action",
-                values="Count",
-                fill_value=0,
-                aggfunc="sum",
-            ).reset_index()
-
-            with st.expander("Action Summary by OI Read", expanded=False):
-                st.dataframe(pivot, use_container_width=True, hide_index=True)
-
         # ---------------------------
-        # Sort by confidence
+        # Sort & column order (clean)
         # ---------------------------
         if "Action Confidence" in ideas.columns:
             ideas = ideas.sort_values("Action Confidence", ascending=False)
 
-        # ---------------------------
-        # Column order (clean)
-        # ---------------------------
         preferred_order = [
             "Action",
             "Action Confidence",
-            "Trade Label",
-            "Momentum Label",
             "Strike",
             "Type",
             "RSI",
@@ -376,13 +375,10 @@ with right:
                     )
                 if not diag.empty:
                     st.markdown("#### Diagnostic (why no ideas?)")
-                    st.dataframe(reorder(diag), use_container_width=True, hide_index=True)
+                    st.dataframe(diag, use_container_width=True, hide_index=True)
         else:
             st.dataframe(ideas, use_container_width=True, hide_index=True)
 
-        # ---------------------------
-        # Optional: show full scan
-        # ---------------------------
         if show_all_rows:
             with st.expander("All scanned rows", expanded=False):
                 st.dataframe(result, use_container_width=True, hide_index=True)
@@ -401,7 +397,11 @@ with right:
     else:
         st.caption("Set your controls on the left and click **Run Scan**.")
 
+
+# =========================================================
+# Footer
+# =========================================================
 st.caption(
-    "Defaults: 15m timeframe, RSI(14) threshold 55, Supertrend(10,3), "
+    "Production defaults: 15m timeframe, RSI(14) threshold 55, Supertrend(10,3), "
     "ATM filter ON, min confidence 40."
 )
