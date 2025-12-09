@@ -343,6 +343,13 @@ with left:
         key="rsi_threshold"
     )
 
+    strict_rsi = st.checkbox(
+        "Strict RSI filter (hide RSI below threshold)",
+        value=False,
+        help="When ON, only strikes with RSI >= threshold will be shown. "
+             "When OFF, RSI is treated as a soft idea filter."
+    )
+
     st_period = st.number_input(
         "Supertrend period",
         min_value=5, max_value=30, value=10, step=1,
@@ -389,6 +396,7 @@ with right:
     st.subheader("Trade Ideas")
     st.caption("Set controls on the left and click **Run Scan**.")
     run = st.button("Run Scan", type="primary", use_container_width=True, key="run_scan_btn")
+    scan_placeholder = st.empty()
 
     # Everything related to results should render inside this container
     results_area = st.container()
@@ -418,84 +426,88 @@ results_df = None
 
 # -----------------------------
 # Dynamic scan call (prevents keyword errors)
+# Spinner appears directly below Run Scan
 # -----------------------------
 if run:
-    with st.spinner("Scanning option strikes..."):
-        try:
-            fn = scanner.scan_options_trade_ideas
-            params = inspect.signature(fn).parameters
+    try:
+        # ✅ render spinner exactly where this placeholder is placed
+        with scan_placeholder.container():
+            with st.spinner("Scanning option strikes..."):
 
-            kwargs = {}
+                fn = scanner.scan_options_trade_ideas
+                params = inspect.signature(fn).parameters
 
-            # Core
-            if "kite" in params:
-                kwargs["kite"] = kite
-            if "underlying" in params:
-                kwargs["underlying"] = underlying
+                kwargs = {}
 
-            # Normalize expiry to string for scanner compatibility
-            expiry_str = None
-            if expiry is not None:
-                try:
-                    expiry_str = expiry.strftime("%Y-%m-%d")  # if it's a date/datetime
-                except Exception:
-                    expiry_str = str(expiry)  # fallback
+                # Core
+                if "kite" in params:
+                    kwargs["kite"] = kite
+                if "underlying" in params:
+                    kwargs["underlying"] = underlying
 
-            # Expiry mapping (supports multiple scanner versions)
-            if "expiry_date" in params:
-                kwargs["expiry_date"] = expiry_str
-            elif "expiry" in params:
-                kwargs["expiry"] = expiry_str
+                # Normalize expiry to string for scanner compatibility
+                expiry_str = None
+                if expiry is not None:
+                    try:
+                        expiry_str = expiry.strftime("%Y-%m-%d")  # date/datetime
+                    except Exception:
+                        expiry_str = str(expiry)  # fallback
 
-            # Timeframe mapping
-            if "timeframe" in params:
-                kwargs["timeframe"] = timeframe
-            elif "interval" in params:
-                kwargs["interval"] = timeframe
-            elif "timeframe_str" in params:
-                kwargs["timeframe_str"] = timeframe
-            elif "candle_interval" in params:
-                kwargs["candle_interval"] = timeframe
+                # Expiry mapping (supports multiple scanner versions)
+                if "expiry_date" in params:
+                    kwargs["expiry_date"] = expiry_str
+                elif "expiry" in params:
+                    kwargs["expiry"] = expiry_str
 
-            # RSI
-            if "rsi_period" in params:
-                kwargs["rsi_period"] = int(rsi_period)
-            if "rsi_threshold" in params:
-                kwargs["rsi_threshold"] = int(rsi_threshold)
+                # Timeframe mapping
+                if "timeframe" in params:
+                    kwargs["timeframe"] = timeframe
+                elif "interval" in params:
+                    kwargs["interval"] = timeframe
+                elif "timeframe_str" in params:
+                    kwargs["timeframe_str"] = timeframe
+                elif "candle_interval" in params:
+                    kwargs["candle_interval"] = timeframe
 
-            # Supertrend
-            if "st_period" in params:
-                kwargs["st_period"] = int(st_period)
-            if "st_multiplier" in params:
-                kwargs["st_multiplier"] = float(st_mult)
-            elif "st_mult" in params:
-                kwargs["st_mult"] = float(st_mult)
+                # RSI
+                if "rsi_period" in params:
+                    kwargs["rsi_period"] = int(rsi_period)
+                if "rsi_threshold" in params:
+                    kwargs["rsi_threshold"] = int(rsi_threshold)
 
-            # ATM filter
-            if "use_atm_filter" in params:
-                kwargs["use_atm_filter"] = bool(use_atm_filter)
-            if "atm_steps" in params:
-                kwargs["atm_steps"] = int(atm_steps)
+                # Supertrend
+                if "st_period" in params:
+                    kwargs["st_period"] = int(st_period)
+                if "st_multiplier" in params:
+                    kwargs["st_multiplier"] = float(st_mult)
+                elif "st_mult" in params:
+                    kwargs["st_mult"] = float(st_mult)
 
-            # Confidence
-            if "min_confidence" in params:
-                kwargs["min_confidence"] = int(min_conf)
-            elif "min_conf" in params:
-                kwargs["min_conf"] = int(min_conf)
+                # ATM filter
+                if "use_atm_filter" in params:
+                    kwargs["use_atm_filter"] = bool(use_atm_filter)
+                if "atm_steps" in params:
+                    kwargs["atm_steps"] = int(atm_steps)
 
-            # Debug
-            if "debug" in params:
-                kwargs["debug"] = bool(debug_no_match_details)
+                # Confidence
+                if "min_confidence" in params:
+                    kwargs["min_confidence"] = int(min_conf)
+                elif "min_conf" in params:
+                    kwargs["min_conf"] = int(min_conf)
 
-            results_df = fn(**kwargs)
+                # Debug
+                if "debug" in params:
+                    kwargs["debug"] = bool(debug_no_match_details)
 
-        except Exception as e:
-            st.error(f"Scan failed: {e}")
-            results_df = None
+                results_df = fn(**kwargs)
 
-# -----------------------------
-# Render results (RIGHT column)
-# -----------------------------
+        # ✅ clean up spinner area after completion
+        scan_placeholder.empty()
+
+    except Exception as e:
+        scan_placeholder.empty()
+        st.error(f"Scan failed: {e}")
+        results_df = None
 # -----------------------------
 # Render results (RIGHT column)
 # -----------------------------
@@ -550,6 +562,13 @@ with results_area:
             cols = [c for c in preferred if c in results_df.columns]
             remaining = [c for c in results_df.columns if c not in cols]
             final_cols = cols + remaining
+
+            # --- OPTIONAL HARD RSI FILTER (UI-side) ---
+            if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+                if strict_rsi and "RSI" in results_df.columns and rsi_threshold is not None:
+                    results_df = results_df[
+                        results_df["RSI"].fillna(0) >= int(rsi_threshold)
+                    ].copy()
 
             st.dataframe(results_df[final_cols], use_container_width=True, hide_index=True)
 
