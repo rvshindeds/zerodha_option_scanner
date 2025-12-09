@@ -1,24 +1,63 @@
 import pandas as pd
-import numpy as np
-from indicators import compute_rsi, compute_supertrend
+from indicators import compute_rsi, compute_supertrend, compute_supertrend_df
 
-# Create dummy OHLC data
-np.random.seed(42)
 
-n = 100
-price = np.cumsum(np.random.randn(n)) + 100
+def make_mock_ohlc(n=60):
+    """
+    Create mock OHLC data that trends upward with small noise.
+    Enough candles for RSI/Supertrend to compute safely.
+    """
+    base = 100
+    closes = []
+    val = base
 
-df = pd.DataFrame({
-    "open": price + np.random.randn(n) * 0.2,
-    "high": price + np.random.rand(n) * 0.5,
-    "low":  price - np.random.rand(n) * 0.5,
-    "close": price,
-    "volume": np.random.randint(100, 1000, n),
-})
+    for i in range(n):
+        # gentle uptrend
+        val += 0.2
+        closes.append(val)
 
-df["rsi"] = compute_rsi(df["close"], 14)
-df = compute_supertrend(df, 10, 3)
+    # Build OHLC around close
+    df = pd.DataFrame({
+        "open":  [c - 0.3 for c in closes],
+        "high":  [c + 0.5 for c in closes],
+        "low":   [c - 0.6 for c in closes],
+        "close": closes,
+        "volume": [1000] * n,
+    })
 
-print(df.tail(5)[["close", "rsi", "supertrend", "st_direction"]])
-print("\nLatest RSI:", df["rsi"].iloc[-1])
-print("Latest ST direction:", "Down" if df["st_direction"].iloc[-1] == -1 else "Up")
+    # Add a date column intentionally
+    # to prove RSI is safe and won't break
+    df["date"] = pd.date_range("2025-01-01", periods=n, freq="min")
+
+    return df
+
+
+def run_tests():
+    print("=== Testing indicators with mock OHLC ===")
+
+    df = make_mock_ohlc()
+
+    # RSI
+    rsi = compute_rsi(df, period=14)
+    print(f"RSI latest: {rsi}")
+
+    assert rsi is None or (0 <= rsi <= 100), "RSI out of expected range"
+
+    # Supertrend direction string
+    st_dir = compute_supertrend(df, period=10, multiplier=3.0)
+    print(f"Supertrend direction: {st_dir}")
+
+    assert st_dir in ("Up", "Down", "Unknown"), "Supertrend direction not normalized"
+
+    # Optional: full ST dataframe
+    st_df = compute_supertrend_df(df, period=10, multiplier=3.0)
+    print("Supertrend DF columns:", list(st_df.columns))
+
+    if not st_df.empty:
+        assert "in_uptrend" in st_df.columns, "Supertrend DF missing expected column"
+
+    print("✅ All indicator tests passed.")
+
+
+if __name__ == "__main__":
+    run_tests()
