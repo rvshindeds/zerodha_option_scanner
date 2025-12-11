@@ -14,6 +14,7 @@ except Exception:
 
 import scanner  # your existing scanner.py
 
+
 # -----------------------------
 # App config
 # -----------------------------
@@ -31,6 +32,7 @@ APP_VERSION = "v0.1.0"
 API_KEY = os.getenv("KITE_API_KEY", "")
 API_SECRET = os.getenv("KITE_API_SECRET", "")
 
+
 # -----------------------------
 # Safety checks
 # -----------------------------
@@ -42,11 +44,24 @@ def require_kite():
         st.error("Missing KITE_API_KEY / KITE_API_SECRET in .env.")
         st.stop()
 
+
 def make_kite(access_token: Optional[str] = None):
     k = KiteConnect(api_key=API_KEY)
     if access_token:
         k.set_access_token(access_token)
     return k
+
+
+# -----------------------------
+# Full-chain OI loader (no cache to avoid Kite hashing issues)
+# -----------------------------
+def load_full_chain_oi(kite, underlying: str, expiry_str: str):
+    """
+    Simple wrapper around scanner.fetch_full_chain_oi.
+    Used only for the Market / OI Summary tab.
+    """
+    return scanner.fetch_full_chain_oi(kite, underlying, expiry_str)
+
 
 # -----------------------------
 # Cached data helpers
@@ -62,6 +77,7 @@ def fetch_instruments_cached():
             return k.instruments("NFO")
         except Exception:
             return []
+
 
 def extract_expiries(instruments, underlying: str):
     expiries = set()
@@ -82,6 +98,7 @@ def extract_expiries(instruments, underlying: str):
 
     return sorted(list(expiries))
 
+
 def get_underlying_symbol_for_ltp(underlying: str):
     u = underlying.upper()
     if u == "NIFTY":
@@ -92,6 +109,7 @@ def get_underlying_symbol_for_ltp(underlying: str):
         return "NSE:NIFTY FIN SERVICE"
     return f"NSE:{underlying}"
 
+
 def safe_ltp(kite, underlying: str):
     try:
         sym = get_underlying_symbol_for_ltp(underlying)
@@ -99,6 +117,7 @@ def safe_ltp(kite, underlying: str):
         return data.get(sym, {}).get("last_price")
     except Exception:
         return None
+
 
 def compute_strike_step_from_instruments(instruments, underlying: str, expiry):
     u = underlying.upper()
@@ -136,10 +155,12 @@ def compute_strike_step_from_instruments(instruments, underlying: str, expiry):
     diffs = sorted(diffs)
     return diffs[0]
 
+
 def compute_atm(spot: Optional[float], step: Optional[float]):
     if spot is None or step is None or step == 0:
         return None
     return round(spot / step) * step
+
 
 def build_action_summary(df: pd.DataFrame):
     if df is None or df.empty:
@@ -158,6 +179,7 @@ def build_action_summary(df: pd.DataFrame):
         return summary
     except Exception:
         return None
+
 
 # -----------------------------
 # Header
@@ -292,296 +314,392 @@ if not access_token:
 kite = make_kite(access_token=access_token)
 
 # -----------------------------
-# Layout columns
+# Tabs: Scanner + Market / OI Summary
 # -----------------------------
-left, right = st.columns([0.9, 2.1])
+tab_scan, tab_summary = st.tabs(["Scanner", "Market / OI Summary"])
 
-# -----------------------------
-# Controls (LEFT)
-# -----------------------------
-with left:
-    st.subheader("Quick Controls")
+# =============================
+# TAB 1: SCANNER
+# =============================
+with tab_scan:
+    # -----------------------------
+    # Layout columns
+    # -----------------------------
+    left, right = st.columns([0.9, 2.1])
 
-    underlying = st.selectbox(
-        "Underlying",
-        options=["NIFTY", "BANKNIFTY", "FINNIFTY"],
-        index=0,
-        key="underlying_select"
-    )
+    # -----------------------------
+    # Controls (LEFT)
+    # -----------------------------
+    with left:
+        st.subheader("Quick Controls")
 
-    instruments = fetch_instruments_cached()
-    expiries = extract_expiries(instruments, underlying)
-
-    if not expiries:
-        st.warning("Could not detect expiries automatically.")
-        expiry = None
-    else:
-        expiry = st.selectbox(
-            "Expiry",
-            options=expiries,
-            format_func=lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d),
+        underlying = st.selectbox(
+            "Underlying",
+            options=["NIFTY", "BANKNIFTY", "FINNIFTY"],
             index=0,
-            key="expiry_select"
+            key="underlying_select"
         )
 
-    timeframe = st.selectbox(
-        "Timeframe",
-        options=["5minute", "15minute", "30minute", "60minute"],
-        index=1,
-        key="timeframe_select"
-    )
+        instruments = fetch_instruments_cached()
+        expiries = extract_expiries(instruments, underlying)
 
-    rsi_period = st.number_input(
-        "RSI period",
-        min_value=5, max_value=50, value=14, step=1,
-        key="rsi_period"
-    )
-
-    rsi_threshold = st.slider(
-        "RSI threshold (idea filter)",
-        min_value=40, max_value=80, value=60,
-        key="rsi_threshold"
-    )
-
-    strict_rsi = st.checkbox(
-        "Strict RSI filter (hide RSI below threshold)",
-        value=False,
-        help="When ON, only strikes with RSI >= threshold will be shown. "
-             "When OFF, RSI is treated as a soft idea filter."
-    )
-
-    st_period = st.number_input(
-        "Supertrend period",
-        min_value=5, max_value=30, value=10, step=1,
-        key="st_period"
-    )
-
-    st_mult = st.number_input(
-        "Supertrend multiplier",
-        min_value=1.0, max_value=5.0, value=3.0, step=0.5,
-        key="st_mult"
-    )
-
-    st.markdown("### Strike Range")
-    use_atm_filter = st.checkbox("ATM ± X filter", value=True, key="use_atm_filter")
-    atm_steps = st.number_input(
-        "X strike steps",
-        min_value=1, max_value=50, value=10, step=1,
-        key="atm_steps"
-    )
-
-    st.markdown("### Confidence")
-    min_conf = st.slider(
-        "Minimum Action Confidence",
-        min_value=0, max_value=100, value=50,
-        key="min_conf"
-    )
-
-    st.markdown("### Debug")
-    debug_show_strikes = st.checkbox(
-        "Debug: show included strikes",
-        value=False,
-        key="debug_show_strikes"
-    )
-    debug_no_match_details = st.checkbox(
-        "Debug: show no-match diagnostics",
-        value=False,
-        key="debug_no_match_details"
-    )
-
-# -----------------------------
-# Right side header
-# -----------------------------
-with right:
-    st.subheader("Trade Ideas")
-    st.caption("Set controls on the left and click **Run Scan**.")
-    run = st.button("Run Scan", type="primary", use_container_width=True, key="run_scan_btn")
-    scan_placeholder = st.empty()
-
-    # Everything related to results should render inside this container
-    results_area = st.container()
-
-
-# -----------------------------
-# Transparency row (spot/step/ATM)
-# -----------------------------
-spot = safe_ltp(kite, underlying)
-step = compute_strike_step_from_instruments(instruments, underlying, expiry)
-atm = compute_atm(spot, step)
-
-t1, t2, t3 = st.columns(3)
-with t1:
-    st.metric("Detected spot", f"{spot:.2f}" if spot else "N/A")
-with t2:
-    st.metric("Strike step", f"{step:.0f}" if step else "N/A")
-with t3:
-    st.metric("Computed ATM", f"{atm:.0f}" if atm else "N/A")
-
-# -----------------------------
-# Run scan button
-# -----------------------------
-#run = st.button("Run Scan", type="primary", use_container_width=True, key="run_scan_btn")
-
-results_df = None
-
-# -----------------------------
-# Dynamic scan call (prevents keyword errors)
-# Spinner appears directly below Run Scan
-# -----------------------------
-if run:
-    try:
-        # ✅ render spinner exactly where this placeholder is placed
-        with scan_placeholder.container():
-            with st.spinner("Scanning option strikes..."):
-
-                fn = scanner.scan_options_trade_ideas
-                params = inspect.signature(fn).parameters
-
-                kwargs = {}
-
-                # Core
-                if "kite" in params:
-                    kwargs["kite"] = kite
-                if "underlying" in params:
-                    kwargs["underlying"] = underlying
-
-                # Normalize expiry to string for scanner compatibility
-                expiry_str = None
-                if expiry is not None:
-                    try:
-                        expiry_str = expiry.strftime("%Y-%m-%d")  # date/datetime
-                    except Exception:
-                        expiry_str = str(expiry)  # fallback
-
-                # Expiry mapping (supports multiple scanner versions)
-                if "expiry_date" in params:
-                    kwargs["expiry_date"] = expiry_str
-                elif "expiry" in params:
-                    kwargs["expiry"] = expiry_str
-
-                # Timeframe mapping
-                if "timeframe" in params:
-                    kwargs["timeframe"] = timeframe
-                elif "interval" in params:
-                    kwargs["interval"] = timeframe
-                elif "timeframe_str" in params:
-                    kwargs["timeframe_str"] = timeframe
-                elif "candle_interval" in params:
-                    kwargs["candle_interval"] = timeframe
-
-                # RSI
-                if "rsi_period" in params:
-                    kwargs["rsi_period"] = int(rsi_period)
-                if "rsi_threshold" in params:
-                    kwargs["rsi_threshold"] = int(rsi_threshold)
-
-                # Supertrend
-                if "st_period" in params:
-                    kwargs["st_period"] = int(st_period)
-                if "st_multiplier" in params:
-                    kwargs["st_multiplier"] = float(st_mult)
-                elif "st_mult" in params:
-                    kwargs["st_mult"] = float(st_mult)
-
-                # ATM filter
-                if "use_atm_filter" in params:
-                    kwargs["use_atm_filter"] = bool(use_atm_filter)
-                if "atm_steps" in params:
-                    kwargs["atm_steps"] = int(atm_steps)
-
-                # Confidence
-                if "min_confidence" in params:
-                    kwargs["min_confidence"] = int(min_conf)
-                elif "min_conf" in params:
-                    kwargs["min_conf"] = int(min_conf)
-
-                # Debug
-                if "debug" in params:
-                    kwargs["debug"] = bool(debug_no_match_details)
-
-                results_df = fn(**kwargs)
-
-        # ✅ clean up spinner area after completion
-        scan_placeholder.empty()
-
-    except Exception as e:
-        scan_placeholder.empty()
-        st.error(f"Scan failed: {e}")
-        results_df = None
-# -----------------------------
-# Render results (RIGHT column)
-# -----------------------------
-with results_area:
-    if isinstance(results_df, pd.DataFrame):
-
-        # ✅ HARD enforce Minimum Confidence in UI (guaranteed)
-        if not results_df.empty and "Action Confidence" in results_df.columns:
-            results_df = results_df[
-                results_df["Action Confidence"].fillna(0) >= int(min_conf)
-            ].copy()
-
-        if results_df.empty:
-            st.warning("No matching strikes found for the selected settings.")
-            if debug_no_match_details:
-                st.info(
-                    "Debug tips: Increase ATM ± X range, lower RSI threshold, "
-                    "lower minimum confidence, or try a different timeframe."
-                )
+        if not expiries:
+            st.warning("Could not detect expiries automatically.")
+            expiry = None
         else:
-            # Top mini counters
-            action_counts = {}
-            if "Action" in results_df.columns:
-                action_counts = results_df["Action"].value_counts().to_dict()
+            expiry = st.selectbox(
+                "Expiry",
+                options=expiries,
+                format_func=lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d),
+                index=0,
+                key="expiry_select"
+            )
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("BUY CALL", action_counts.get("BUY CALL", 0))
-            c2.metric("SELL CALL", action_counts.get("SELL CALL", 0))
-            c3.metric("BUY PUT", action_counts.get("BUY PUT", 0))
-            c4.metric("SELL PUT", action_counts.get("SELL PUT", 0))
+        timeframe = st.selectbox(
+            "Timeframe",
+            options=["5minute", "15minute", "30minute", "60minute"],
+            index=1,
+            key="timeframe_select"
+        )
 
-            # Action Summary by OI Read
-            summary = build_action_summary(results_df)
-            with st.expander("Action Summary by OI Read", expanded=False):
-                if summary is None or summary.empty:
-                    st.caption("Summary appears when both 'OI Read' and 'Action' are available.")
-                else:
-                    st.dataframe(summary, use_container_width=True, hide_index=True)
+        rsi_period = st.number_input(
+            "RSI period",
+            min_value=5, max_value=50, value=14, step=1,
+            key="rsi_period"
+        )
 
-            # Debug: show strikes included
-            if debug_show_strikes and "Strike" in results_df.columns:
-                strikes = sorted(results_df["Strike"].dropna().unique().tolist())
-                st.caption(f"Filtered scan strikes ({len(strikes)}):")
-                st.write(strikes)
+        rsi_threshold = st.slider(
+            "RSI threshold (idea filter)",
+            min_value=40, max_value=80, value=60,
+            key="rsi_threshold"
+        )
 
-            # Preferred display order
-            preferred = [
-                "Action", "Action Confidence", "Trade Label", "Momentum Label",
-                "Strike", "Type", "RSI", "ST Trend",
-                "Price Δ", "OI Δ", "OI Read", "Symbol"
-            ]
-            cols = [c for c in preferred if c in results_df.columns]
-            remaining = [c for c in results_df.columns if c not in cols]
-            final_cols = cols + remaining
+        strict_rsi = st.checkbox(
+            "Strict RSI filter (hide RSI below threshold)",
+            value=False,
+            help="When ON, only strikes with RSI >= threshold will be shown. "
+                 "When OFF, RSI is treated as a soft idea filter."
+        )
 
-            # --- OPTIONAL HARD RSI FILTER (UI-side) ---
+        st_period = st.number_input(
+            "Supertrend period",
+            min_value=5, max_value=30, value=10, step=1,
+            key="st_period"
+        )
+
+        st_mult = st.number_input(
+            "Supertrend multiplier",
+            min_value=1.0, max_value=5.0, value=3.0, step=0.5,
+            key="st_mult"
+        )
+
+        st.markdown("### Strike Range")
+        use_atm_filter = st.checkbox("ATM ± X filter", value=True, key="use_atm_filter")
+        atm_steps = st.number_input(
+            "X strike steps",
+            min_value=1, max_value=50, value=10, step=1,
+            key="atm_steps"
+        )
+
+        st.markdown("### Confidence")
+        min_conf = st.slider(
+            "Minimum Action Confidence",
+            min_value=0, max_value=100, value=50,
+            key="min_conf"
+        )
+
+        st.markdown("### Debug")
+        debug_show_strikes = st.checkbox(
+            "Debug: show included strikes",
+            value=False,
+            key="debug_show_strikes"
+        )
+        debug_no_match_details = st.checkbox(
+            "Debug: show no-match diagnostics",
+            value=False,
+            key="debug_no_match_details"
+        )
+
+    # -----------------------------
+    # Right side header
+    # -----------------------------
+    with right:
+        st.subheader("Trade Ideas")
+        st.caption("Set controls on the left and click **Run Scan**.")
+        run = st.button("Run Scan", type="primary", use_container_width=True, key="run_scan_btn")
+        scan_placeholder = st.empty()
+
+        # Everything related to results should render inside this container
+        results_area = st.container()
+
+    # -----------------------------
+    # Transparency row (spot/step/ATM)
+    # -----------------------------
+    spot = safe_ltp(kite, underlying)
+    step = compute_strike_step_from_instruments(instruments, underlying, expiry)
+    atm = compute_atm(spot, step)
+
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.metric("Detected spot", f"{spot:.2f}" if spot else "N/A")
+    with t2:
+        st.metric("Strike step", f"{step:.0f}" if step else "N/A")
+    with t3:
+        st.metric("Computed ATM", f"{atm:.0f}" if atm else "N/A")
+
+    results_df = None
+
+    # -----------------------------
+    # Dynamic scan call (prevents keyword errors)
+    # Spinner appears directly below Run Scan
+    # -----------------------------
+    if run:
+        try:
+            # render spinner exactly where this placeholder is placed
+            with scan_placeholder.container():
+                with st.spinner("Scanning option strikes..."):
+
+                    fn = scanner.scan_options_trade_ideas
+                    params = inspect.signature(fn).parameters
+
+                    kwargs = {}
+
+                    # Core
+                    if "kite" in params:
+                        kwargs["kite"] = kite
+                    if "underlying" in params:
+                        kwargs["underlying"] = underlying
+
+                    # Normalize expiry to string for scanner compatibility
+                    expiry_str = None
+                    if expiry is not None:
+                        try:
+                            expiry_str = expiry.strftime("%Y-%m-%d")  # date/datetime
+                        except Exception:
+                            expiry_str = str(expiry)  # fallback
+
+                    # Expiry mapping (supports multiple scanner versions)
+                    if "expiry_date" in params:
+                        kwargs["expiry_date"] = expiry_str
+                    elif "expiry" in params:
+                        kwargs["expiry"] = expiry_str
+
+                    # Timeframe mapping
+                    if "timeframe" in params:
+                        kwargs["timeframe"] = timeframe
+                    elif "interval" in params:
+                        kwargs["interval"] = timeframe
+                    elif "timeframe_str" in params:
+                        kwargs["timeframe_str"] = timeframe
+                    elif "candle_interval" in params:
+                        kwargs["candle_interval"] = timeframe
+
+                    # RSI
+                    if "rsi_period" in params:
+                        kwargs["rsi_period"] = int(rsi_period)
+                    if "rsi_threshold" in params:
+                        kwargs["rsi_threshold"] = int(rsi_threshold)
+
+                    # Supertrend
+                    if "st_period" in params:
+                        kwargs["st_period"] = int(st_period)
+                    if "st_multiplier" in params:
+                        kwargs["st_multiplier"] = float(st_mult)
+                    elif "st_mult" in params:
+                        kwargs["st_mult"] = float(st_mult)
+
+                    # ATM filter
+                    if "use_atm_filter" in params:
+                        kwargs["use_atm_filter"] = bool(use_atm_filter)
+                    if "atm_steps" in params:
+                        kwargs["atm_steps"] = int(atm_steps)
+
+                    # Confidence
+                    if "min_confidence" in params:
+                        kwargs["min_confidence"] = int(min_conf)
+                    elif "min_conf" in params:
+                        kwargs["min_conf"] = int(min_conf)
+
+                    # Debug
+                    if "debug" in params:
+                        kwargs["debug"] = bool(debug_no_match_details)
+
+                    results_df = fn(**kwargs)
+
+            # clean up spinner area after completion
+            scan_placeholder.empty()
+
+        except Exception as e:
+            scan_placeholder.empty()
+            st.error(f"Scan failed: {e}")
+            results_df = None
+
+    # -----------------------------
+    # Render results (RIGHT column)
+    # -----------------------------
+    with results_area:
+        if isinstance(results_df, pd.DataFrame):
+
+            # HARD enforce Minimum Confidence in UI (guaranteed)
+            if not results_df.empty and "Action Confidence" in results_df.columns:
+                results_df = results_df[
+                    results_df["Action Confidence"].fillna(0) >= int(min_conf)
+                ].copy()
+
+            # OPTIONAL HARD RSI FILTER (UI-side)
             if isinstance(results_df, pd.DataFrame) and not results_df.empty:
                 if strict_rsi and "RSI" in results_df.columns and rsi_threshold is not None:
                     results_df = results_df[
                         results_df["RSI"].fillna(0) >= int(rsi_threshold)
                     ].copy()
 
-            st.dataframe(results_df[final_cols], use_container_width=True, hide_index=True)
+            if results_df.empty:
+                st.warning("No matching strikes found for the selected settings.")
+                if debug_no_match_details:
+                    st.info(
+                        "Debug tips: Increase ATM ± X range, lower RSI threshold, "
+                        "lower minimum confidence, or try a different timeframe."
+                    )
+            else:
+                # Top mini counters
+                action_counts = {}
+                if "Action" in results_df.columns:
+                    action_counts = results_df["Action"].value_counts().to_dict()
 
-            # CSV export
-            csv = results_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download results (CSV)",
-                data=csv,
-                file_name=f"{underlying}_options_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-                key="download_csv_btn"
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("BUY CALL", action_counts.get("BUY CALL", 0))
+                c2.metric("SELL CALL", action_counts.get("SELL CALL", 0))
+                c3.metric("BUY PUT", action_counts.get("BUY PUT", 0))
+                c4.metric("SELL PUT", action_counts.get("SELL PUT", 0))
+
+                # Action Summary by OI Read
+                summary = build_action_summary(results_df)
+                with st.expander("Action Summary by OI Read", expanded=False):
+                    if summary is None or summary.empty:
+                        st.caption("Summary appears when both 'OI Read' and 'Action' are available.")
+                    else:
+                        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+                # Debug: show strikes included
+                if debug_show_strikes and "Strike" in results_df.columns:
+                    strikes = sorted(results_df["Strike"].dropna().unique().tolist())
+                    st.caption(f"Filtered scan strikes ({len(strikes)}):")
+                    st.write(strikes)
+
+                # Preferred display order
+                preferred = [
+                    "Action", "Action Confidence", "Trade Label", "Momentum Label",
+                    "Strike", "Type", "RSI", "ST Trend",
+                    "Price Δ", "OI Δ", "OI Read", "Symbol"
+                ]
+                cols = [c for c in preferred if c in results_df.columns]
+                remaining = [c for c in results_df.columns if c not in cols]
+                final_cols = cols + remaining
+
+                st.dataframe(results_df[final_cols], use_container_width=True, hide_index=True)
+
+                # CSV export
+                csv = results_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download results (CSV)",
+                    data=csv,
+                    file_name=f"{underlying}_options_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="download_csv_btn"
+                )
+
+        else:
+            st.caption("Ready. Click **Run Scan**.")
+
+
+# =============================
+# TAB 2: MARKET / OI SUMMARY
+# =============================
+with tab_summary:
+    st.markdown("### 1️⃣ Market / Directional View (from OI)")
+
+    # Reuse expiry + spot from scanner tab
+    expiry_str = None
+    try:
+        expiry_str = expiry.strftime("%Y-%m-%d") if expiry is not None else None
+    except Exception:
+        expiry_str = str(expiry) if expiry is not None else None
+
+    detected_spot = spot if "spot" in locals() else None
+
+    if kite is None or expiry_str is None:
+        st.info("Login and select an expiry to view OI summary.")
+    else:
+        # Full option-chain snapshot for this expiry
+        full_chain_df = load_full_chain_oi(kite, underlying, expiry_str)
+        oi_summary = scanner.summarize_oi_chain(full_chain_df)
+
+        # Header row: Underlying, Expiry, Spot, PCR
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Underlying", underlying)
+        c2.metric("Expiry", expiry_str)
+        c3.metric("Spot (approx)", f"{detected_spot:,.2f}" if detected_spot else "N/A")
+        pcr_display = (
+            f"{oi_summary['pcr_oi']:.2f}" if oi_summary["pcr_oi"] is not None else "N/A"
+        )
+        c4.metric("PCR (OI-based)", pcr_display)
+
+        if full_chain_df is None or full_chain_df.empty:
+            st.warning("Not enough OI data to form a directional view.")
+        else:
+            # Placeholder directional text – you can refine later to use a richer model
+            st.write("Directional OI view: full-chain data loaded (you can add richer logic here).")
+
+        st.markdown("### 2️⃣ Key OI Levels")
+
+        if full_chain_df is None or full_chain_df.empty:
+            st.info("No OI data available for this expiry.")
+        else:
+            # Highest CE / PE OI, using FULL chain
+            ce_strike = oi_summary["highest_ce_strike"]
+            pe_strike = oi_summary["highest_pe_strike"]
+
+            ce_text = (
+                f"**Highest CE OI** at strike **{ce_strike:,.0f}**"
+                if ce_strike is not None
+                else "No CE OI data."
+            )
+            pe_text = (
+                f"**Highest PE OI** at strike **{pe_strike:,.0f}**"
+                if pe_strike is not None
+                else "No PE OI data."
             )
 
-    else:
-        st.caption("Ready. Click **Run Scan**.")
+            st.markdown(f"- {ce_text}")
+            st.markdown(f"- {pe_text}")
+            st.markdown(
+                f"- Total CE OI: **{oi_summary['total_ce_oi']:,.0f}**, "
+                f"Total PE OI: **{oi_summary['total_pe_oi']:,.0f}**"
+            )
+
+            # Raw chain viewer
+            with st.expander("Show raw option-chain snapshot (full chain for this expiry)"):
+                st.dataframe(
+                    full_chain_df.sort_values(["type", "strike"]),
+                    use_container_width=True,
+                    height=400,
+                )
+
+    st.markdown("### 3️⃣ Intraday Option-Selling Structures")
+    st.markdown(
+        """
+**Sample structures using OI clusters** (you still confirm with live data):
+
+- **Setup A — Short Call at Resistance**  
+  Sell OTM CE at or just below the highest CE OI strike when price struggles below that zone.
+
+- **Setup B — Short Strangle / Iron Condor (Range-bound view)**  
+  Sell CE at upper OI cluster + PE at lower OI cluster when price trades in the middle and PCR ≈ 1.
+
+- **Setup C — Short Put near Support**  
+  Sell OTM PE at strongest PE OI strike when price bounces from lower levels and PCR > 1.
+
+Always confirm with intraday price action, IV behaviour, and strict risk management.
+        """
+    )
