@@ -1,5 +1,5 @@
 import datetime as dt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 
@@ -45,7 +45,6 @@ def get_expiries_for_underlying(instruments_df: pd.DataFrame, underlying: str) -
     if "name" in df.columns:
         df = df[df["name"].astype(str).str.upper() == underlying]
     else:
-        # fallback
         df = df[df["tradingsymbol"].astype(str).str.upper().str.startswith(underlying)]
 
     expiries = sorted({e for e in df.get("expiry", []) if pd.notna(e)})
@@ -123,6 +122,86 @@ def get_atm_context(
 
 
 # =========================================================
+# SPOT trend (Step 2)
+# =========================================================
+_SPOT_TOKEN_CACHE: Dict[str, int] = {}
+
+
+def _resolve_spot_token(kite, underlying: str) -> Optional[int]:
+    """
+    Resolve instrument_token for the underlying's spot index via NSE/BSE instruments.
+    Caches result per underlying to avoid repeated downloads.
+    """
+    u = underlying.upper().strip()
+    if u in _SPOT_TOKEN_CACHE:
+        return _SPOT_TOKEN_CACHE[u]
+
+    spot_symbol = _get_spot_symbol(u)  # e.g. "NSE:NIFTY 50"
+    exch, ts = spot_symbol.split(":", 1)
+
+    try:
+        inst = kite.instruments(exch)  # NSE / BSE
+    except Exception:
+        return None
+
+    df = pd.DataFrame(inst)
+    if df.empty:
+        return None
+
+    m = df[df.get("tradingsymbol", "").astype(str) == ts]
+    if m.empty:
+        m = df[df.get("name", "").astype(str) == ts]
+
+    if m.empty:
+        return None
+
+    token = int(m.iloc[0]["instrument_token"])
+    _SPOT_TOKEN_CACHE[u] = token
+    return token
+
+
+def get_spot_trend(
+    kite,
+    underlying: str,
+    interval: str = "15minute",
+    lookback_days: int = 7,
+    st_period: int = 10,
+    st_mult: float = 3.0,
+) -> str:
+    """
+    Compute SPOT Supertrend direction ('Up'/'Down') for the underlying index.
+    Returns 'Unknown' if token/candles not available.
+    """
+    token = _resolve_spot_token(kite, underlying)
+    if token is None:
+        return "Unknown"
+
+    to_dt = dt.datetime.now()
+    from_dt = to_dt - dt.timedelta(days=lookback_days)
+
+    try:
+        candles = kite.historical_data(
+            instrument_token=token,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+            continuous=False,
+            oi=False,
+        )
+    except Exception:
+        return "Unknown"
+
+    if not candles:
+        return "Unknown"
+
+    df = pd.DataFrame(candles)
+    try:
+        return compute_supertrend(df, period=int(st_period), multiplier=float(st_mult))
+    except Exception:
+        return "Unknown"
+
+
+# =========================================================
 # Option chain filtering
 # =========================================================
 def _get_option_chain_for_expiry(
@@ -145,7 +224,6 @@ def _get_option_chain_for_expiry(
     df = df[df["expiry"] == expiry]
     df = df[pd.notna(df["strike"])]
 
-    # Standardize type
     if "instrument_type" in df.columns:
         df["Type"] = df["instrument_type"].astype(str).str.upper()
     else:
@@ -162,6 +240,49 @@ def _get_option_chain_for_expiry(
     )
 
     return df[["Symbol", "instrument_token", "Strike", "Type"]].dropna()
+
+
+# =========================================================
+# Step 3 — Liquidity / execution filters
+# =========================================================
+def _passes_liquidity_filters(
+    quote: dict,
+    min_oi: int,
+    min_volume: int,
+    max_spread_pct: float,
+    min_ltp: float,
+) -> bool:
+    """
+    Hard execution-quality filters.
+    Tolerant: spread check applies only if depth data is available.
+    """
+    try:
+        ltp = float(quote.get("last_price", 0) or 0)
+        oi = float(quote.get("oi", 0) or 0)
+        vol = float(quote.get("volume", 0) or 0)
+
+        if ltp < min_ltp:
+            return False
+        if oi < min_oi:
+            return False
+        if vol < min_volume:
+            return False
+
+        depth = quote.get("depth") or {}
+        buy = depth.get("buy") or []
+        sell = depth.get("sell") or []
+
+        if buy and sell:
+            bid = float((buy[0] or {}).get("price", 0) or 0)
+            ask = float((sell[0] or {}).get("price", 0) or 0)
+            if bid > 0 and ask > 0 and ltp > 0:
+                spread_pct = ((ask - bid) / ltp) * 100.0
+                if spread_pct > float(max_spread_pct):
+                    return False
+
+        return True
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -209,7 +330,7 @@ def _compute_price_oi_delta(df: pd.DataFrame) -> Tuple[float, float]:
 
 
 # =========================================================
-# Two-layer action model (PE + CE)
+# Two-layer action model (Step 1 + Step 2)
 # =========================================================
 def classify_action_two_layer(
     opt_type: str,
@@ -218,31 +339,18 @@ def classify_action_two_layer(
     price_delta: float,
     oi_delta: float,
     rsi_threshold: float = 55.0,
+    spot_trend: str = "Unknown",
 ) -> Dict:
     """
     Two-layer interpretation model.
     Returns:
       Action, Action Confidence, OI Read, Momentum Label, Trade Label
-
-    PE philosophy:
-      - Long buildup (price↑ + OI↑) -> SELL PUT (higher confidence)
-      - Short covering (price↑ + OI↓) -> SELL PUT (medium/low)
-      - Long unwinding (price↓ + OI↓) -> WATCH / avoid sell
-      - BUY PUT only for rare panic momentum
-
-    CE mirror:
-      - Long buildup -> SELL CALL (higher)
-      - Short covering -> SELL CALL (medium/low)
-      - Long unwinding -> WATCH / avoid sell
-      - BUY CALL only for rare panic momentum
     """
-
     opt_type = (opt_type or "").upper().strip()
     st_trend = (st_trend or "Unknown").title().strip()
+    spot_trend = (spot_trend or "Unknown").title().strip()
 
-    # ---------------------------
     # OI Read
-    # ---------------------------
     if price_delta > 0 and oi_delta > 0:
         oi_read = "Long buildup"
     elif price_delta > 0 and oi_delta < 0:
@@ -259,7 +367,6 @@ def classify_action_two_layer(
     rsi_high = (rsi is not None) and (rsi >= max(60, rsi_threshold + 5))
     rsi_very_high = (rsi is not None) and (rsi >= 70)
 
-    # Side word for labels
     side_word = "PUT" if opt_type == "PE" else "CALL"
 
     # Momentum label
@@ -275,25 +382,18 @@ def classify_action_two_layer(
     confidence = 25
     trade_label = "WATCH / WAIT (No clean edge)"
 
-    # =========================================================
     # PE rules
-    # =========================================================
     if opt_type == "PE":
-
         if oi_read == "Long buildup":
             action = "SELL PUT"
             confidence = 75
             trade_label = "SELL PUT (Bullish premium + OI expansion) — Higher confidence"
-
-            # Conservative ST/RSI boosts
             if st_trend == "Up":
                 confidence += 8
             if rsi_high:
                 confidence += 8
             confidence = min(confidence, 92)
 
-            # Rare panic override -> BUY PUT
-            # Only if strong demand surge is suspected
             if st_trend == "Up" and rsi_very_high and abs(oi_delta) > 500000:
                 action = "BUY PUT"
                 confidence = 68
@@ -304,7 +404,6 @@ def classify_action_two_layer(
             action = "SELL PUT"
             confidence = 50
             trade_label = "SELL PUT (Mean reversion candidate) — Medium confidence"
-
             if st_trend == "Up":
                 confidence += 5
             if rsi_ok:
@@ -317,34 +416,26 @@ def classify_action_two_layer(
             trade_label = "AVOID SELL PUT (Premium shrinking) — Wait for stabilization"
 
         elif oi_read == "Short buildup":
-            # Put premium falling with OI rising:
-            # Can be bearish pressure; DON'T encourage SELL PUT here.
             action = "WATCH"
             confidence = 45 if st_trend == "Down" else 35
             trade_label = "WATCH (Rising put activity / potential downside pressure)"
-
         else:
             action = "WATCH"
             confidence = 25
             trade_label = "WATCH / WAIT"
 
-    # =========================================================
-    # CE rules (mirrored)
-    # =========================================================
+    # CE rules
     elif opt_type == "CE":
-
         if oi_read == "Long buildup":
             action = "SELL CALL"
             confidence = 75
             trade_label = "SELL CALL (Mean reversion candidate) — Higher confidence"
-
             if st_trend == "Up":
                 confidence += 8
             if rsi_high:
                 confidence += 8
             confidence = min(confidence, 92)
 
-            # Rare panic override -> BUY CALL
             if st_trend == "Up" and rsi_very_high and abs(oi_delta) > 500000:
                 action = "BUY CALL"
                 confidence = 68
@@ -355,7 +446,6 @@ def classify_action_two_layer(
             action = "SELL CALL"
             confidence = 50
             trade_label = "SELL CALL (Mean reversion candidate) — Medium confidence"
-
             if st_trend == "Up":
                 confidence += 5
             if rsi_ok:
@@ -371,7 +461,6 @@ def classify_action_two_layer(
             action = "WATCH"
             confidence = 45 if st_trend == "Down" else 35
             trade_label = "WATCH (Rising call activity / potential upside squeeze risk)"
-
         else:
             action = "WATCH"
             confidence = 25
@@ -383,7 +472,26 @@ def classify_action_two_layer(
         trade_label = "IGNORE"
         momentum_label = "UNKNOWN"
 
-    # Cap confidence bounds
+    # Step 1: Momentum vs ST conflict
+    momentum_dir = None
+    if "MOMENTUM UP" in momentum_label:
+        momentum_dir = "Up"
+    elif "MOMENTUM DOWN" in momentum_label:
+        momentum_dir = "Down"
+
+    if momentum_dir in ("Up", "Down") and st_trend in ("Up", "Down") and momentum_dir != st_trend:
+        confidence -= 12
+        if action != "WATCH":
+            trade_label = f"{trade_label} (ST conflict)"
+
+    # Step 2: SPOT trend gate
+    if action == "SELL CALL" and spot_trend == "Up":
+        confidence -= 20
+        trade_label = f"{trade_label} (Against SPOT trend)"
+    if action == "SELL PUT" and spot_trend == "Down":
+        confidence -= 20
+        trade_label = f"{trade_label} (Against SPOT trend)"
+
     confidence = max(0, min(100, int(confidence)))
 
     return {
@@ -410,23 +518,46 @@ def scan_options_with_indicators(
     st_mult: float = 3.0,
     use_atm_filter: bool = True,
     atm_steps: int = 10,
+    # STEP 3 — Liquidity filters (tune later from app.py)
+    min_oi: int = 10_000,
+    min_volume: int = 100,
+    max_spread_pct: float = 8.0,
+    min_ltp: float = 5.0,
 ) -> pd.DataFrame:
     """
     Returns raw indicator rows for all strikes in the filtered scan range.
-    Used for diagnostics when no trade ideas appear.
     """
 
     instruments_df = fetch_instruments_df(kite)
     chain = _get_option_chain_for_expiry(instruments_df, underlying, expiry_date)
-
     if chain.empty:
         return pd.DataFrame()
 
-    # ATM range filter
+    # Step 2: SPOT trend once per scan
+    spot_tr = get_spot_trend(
+        kite=kite,
+        underlying=underlying,
+        interval=interval,
+        lookback_days=int(lookback_days),
+        st_period=int(st_period),
+        st_mult=float(st_mult),
+    )
+
+    # ATM filter
     if use_atm_filter:
         atm_ctx = get_atm_context(kite, instruments_df, underlying, expiry_date, atm_steps=int(atm_steps))
         low, high = atm_ctx["low"], atm_ctx["high"]
         chain = chain[(chain["Strike"] >= low) & (chain["Strike"] <= high)]
+
+    if chain.empty:
+        return pd.DataFrame()
+
+    # Step 3: batch quote once (VERY IMPORTANT)
+    tokens = chain["instrument_token"].astype(int).tolist()
+    try:
+        quotes_map = kite.quote(tokens)  # one call
+    except Exception:
+        quotes_map = {}
 
     rows = []
 
@@ -435,6 +566,20 @@ def scan_options_with_indicators(
         sym = c["Symbol"]
         strike = float(c["Strike"])
         opt_type = c["Type"]
+
+        quote = quotes_map.get(str(token)) or quotes_map.get(token)
+        if not quote:
+            continue
+
+        # Step 3: liquidity gate
+        if not _passes_liquidity_filters(
+            quote=quote,
+            min_oi=int(min_oi),
+            min_volume=int(min_volume),
+            max_spread_pct=float(max_spread_pct),
+            min_ltp=float(min_ltp),
+        ):
+            continue
 
         ohlc = _fetch_ohlc(kite, token, interval, lookback_days)
         if ohlc.empty or len(ohlc) < 3:
@@ -448,6 +593,7 @@ def scan_options_with_indicators(
         cls = classify_action_two_layer(
             opt_type=opt_type,
             st_trend=st_dir,
+            spot_trend=spot_tr,
             rsi=rsi_val,
             price_delta=price_delta,
             oi_delta=oi_delta,
@@ -460,6 +606,7 @@ def scan_options_with_indicators(
                 "Strike": int(strike) if strike.is_integer() else strike,
                 "Type": opt_type,
                 "ST Trend": st_dir,
+                "SPOT Trend": spot_tr,
                 "RSI": round(float(rsi_val), 2) if rsi_val is not None else None,
                 "Price Δ": round(float(price_delta), 2),
                 "OI Δ": int(oi_delta),
@@ -468,6 +615,10 @@ def scan_options_with_indicators(
                 "Trade Label": cls["Trade Label"],
                 "Action": cls["Action"],
                 "Action Confidence": cls["Action Confidence"],
+                # Optional: expose execution metrics for debugging
+                "LTP": float(quote.get("last_price", 0) or 0),
+                "VOL": float(quote.get("volume", 0) or 0),
+                "OI": float(quote.get("oi", 0) or 0),
             }
         )
 
@@ -496,12 +647,17 @@ def scan_options_trade_ideas(
     st_mult: float = 3.0,
     use_atm_filter: bool = True,
     atm_steps: int = 10,
+    # Step 3 pass-through
+    min_oi: int = 10_000,
+    min_volume: int = 100,
+    max_spread_pct: float = 8.0,
+    min_ltp: float = 5.0,
 ) -> pd.DataFrame:
     """
     Production scan wrapper used by app.py.
     Returns the full scan DataFrame, letting the UI filter by confidence.
     """
-    df = scan_options_with_indicators(
+    return scan_options_with_indicators(
         kite=kite,
         underlying=underlying,
         expiry_date=expiry_date,
@@ -513,5 +669,108 @@ def scan_options_trade_ideas(
         st_mult=st_mult,
         use_atm_filter=use_atm_filter,
         atm_steps=atm_steps,
+        min_oi=min_oi,
+        min_volume=min_volume,
+        max_spread_pct=max_spread_pct,
+        min_ltp=min_ltp,
     )
+
+
+# =============================================================================
+# Full option-chain OI utilities (for Market / OI Summary tab)
+# =============================================================================
+def fetch_full_chain_oi(kite, underlying: str, expiry_date: str) -> pd.DataFrame:
+    """
+    Fetch a *full* option-chain snapshot (CE + PE) for a given underlying + expiry.
+    """
+    try:
+        expiry = dt.datetime.fromisoformat(expiry_date).date()
+    except Exception:
+        return pd.DataFrame(columns=["strike", "type", "oi", "ltp"])
+
+    try:
+        instruments = kite.instruments("NFO")
+    except Exception:
+        return pd.DataFrame(columns=["strike", "type", "oi", "ltp"])
+
+    chain = [
+        inst for inst in instruments
+        if inst.get("segment") == "NFO-OPT"
+        and inst.get("name") == underlying
+        and inst.get("expiry") == expiry
+    ]
+
+    if not chain:
+        return pd.DataFrame(columns=["strike", "type", "oi", "ltp"])
+
+    tokens = [inst["instrument_token"] for inst in chain]
+
+    try:
+        quotes = kite.quote(tokens)
+    except Exception:
+        return pd.DataFrame(columns=["strike", "type", "oi", "ltp"])
+
+    rows = []
+    for inst in chain:
+        token = inst["instrument_token"]
+        q = quotes.get(str(token)) or quotes.get(token)
+        if not q:
+            continue
+
+        oi = q.get("oi", 0) or 0
+        ltp = q.get("last_price", 0) or 0.0
+
+        rows.append(
+            {
+                "strike": float(inst.get("strike", 0)),
+                "type": (inst.get("instrument_type", "") or "").upper(),
+                "oi": float(oi),
+                "ltp": float(ltp),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["strike", "type", "oi", "ltp"])
+
+    df = pd.DataFrame(rows)
+    df["type"] = df["type"].astype(str).str.upper()
     return df
+
+
+def summarize_oi_chain(df: pd.DataFrame) -> dict:
+    """
+    Build a simple OI summary from a full-chain DataFrame.
+    """
+    summary = {
+        "total_ce_oi": 0.0,
+        "total_pe_oi": 0.0,
+        "pcr_oi": None,
+        "highest_ce_strike": None,
+        "highest_ce_oi": 0.0,
+        "highest_pe_strike": None,
+        "highest_pe_oi": 0.0,
+    }
+
+    if df is None or df.empty:
+        return summary
+
+    ce = df[df["type"] == "CE"]
+    pe = df[df["type"] == "PE"]
+
+    summary["total_ce_oi"] = float(ce["oi"].sum()) if not ce.empty else 0.0
+    summary["total_pe_oi"] = float(pe["oi"].sum()) if not pe.empty else 0.0
+
+    if summary["total_ce_oi"] > 0 and not ce.empty:
+        idx = ce["oi"].idxmax()
+        summary["highest_ce_strike"] = float(ce.loc[idx, "strike"])
+        summary["highest_ce_oi"] = float(ce.loc[idx, "oi"])
+
+    if summary["total_pe_oi"] > 0 and not pe.empty:
+        idx = pe["oi"].idxmax()
+        summary["highest_pe_strike"] = float(pe.loc[idx, "strike"])
+        summary["highest_pe_oi"] = float(pe.loc[idx, "oi"])
+
+    if summary["total_ce_oi"] > 0:
+        summary["pcr_oi"] = summary["total_pe_oi"] / summary["total_ce_oi"]
+
+    return summary
