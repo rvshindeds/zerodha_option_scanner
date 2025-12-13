@@ -1,4 +1,5 @@
 import os
+import datetime as dt
 import inspect
 from datetime import datetime
 from typing import Optional
@@ -7,12 +8,14 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+import trade_manager
+
 try:
     from kiteconnect import KiteConnect
 except Exception:
     KiteConnect = None
 
-import scanner  # your existing scanner.py
+import scanner  # scanner.py
 
 
 # -----------------------------
@@ -28,7 +31,6 @@ st.set_page_config(
 load_dotenv()
 
 APP_VERSION = "v0.1.0"
-
 API_KEY = os.getenv("KITE_API_KEY", "")
 API_SECRET = os.getenv("KITE_API_SECRET", "")
 
@@ -78,7 +80,6 @@ def fetch_instruments_cached():
 def extract_expiries(instruments, underlying: str):
     expiries = set()
     u = underlying.upper()
-
     for ins in instruments:
         try:
             if ins.get("instrument_type") not in ("CE", "PE"):
@@ -91,7 +92,6 @@ def extract_expiries(instruments, underlying: str):
                     expiries.add(exp)
         except Exception:
             continue
-
     return sorted(list(expiries))
 
 
@@ -118,7 +118,6 @@ def safe_ltp(kite, underlying: str):
 def compute_strike_step_from_instruments(instruments, underlying: str, expiry):
     u = underlying.upper()
     strikes = []
-
     for ins in instruments:
         try:
             if ins.get("instrument_type") not in ("CE", "PE"):
@@ -144,10 +143,8 @@ def compute_strike_step_from_instruments(instruments, underlying: str, expiry):
         d = strikes[i] - strikes[i - 1]
         if d > 0:
             diffs.append(d)
-
     if not diffs:
         return None
-
     diffs = sorted(diffs)
     return diffs[0]
 
@@ -163,26 +160,20 @@ def build_action_summary(df: pd.DataFrame):
         return None
     if "OI Read" not in df.columns or "Action" not in df.columns:
         return None
-
     cols = ["Type", "OI Read", "Action"]
     try:
         summary = (
             df.groupby(cols)
-              .size()
-              .reset_index(name="Count")
-              .sort_values(["Type", "Count"], ascending=[True, False])
+            .size()
+            .reset_index(name="Count")
+            .sort_values(["Type", "Count"], ascending=[True, False])
         )
         return summary
     except Exception:
         return None
 
 
-def render_rejected_summary(
-    raw_df: pd.DataFrame,
-    after_conf_df: pd.DataFrame,
-    after_rsi_df: pd.DataFrame,
-    strict_rsi: bool,
-):
+def render_rejected_summary(raw_df: pd.DataFrame, after_conf_df: pd.DataFrame, after_rsi_df: pd.DataFrame, strict_rsi: bool):
     total = len(raw_df)
     after_conf = len(after_conf_df)
     after_rsi = len(after_rsi_df)
@@ -200,19 +191,16 @@ def render_rejected_summary(
         "Scanner-side rejections (ATM range / candles / quotes / liquidity) are not counted here."
     )
 
+
 def _toast(msg: str):
-    # Streamlit versions differ; toast may not exist everywhere
     if hasattr(st, "toast"):
         st.toast(msg)
     else:
         st.success(msg)
 
+
 def apply_preset(preset: str):
-    """
-    Sets session_state values for controls, then reruns.
-    """
     presets = {
-        # More ideas, more noise
         "discovery": {
             "timeframe_select": "15minute",
             "rsi_period": 14,
@@ -223,13 +211,12 @@ def apply_preset(preset: str):
             "st_period": 10,
             "st_mult": 3.0,
             "strict_rsi": False,
-            "enable_liquidity": False,  # easier to see rows
+            "enable_liquidity": False,
             "min_oi": 0,
             "min_volume": 0,
             "min_ltp": 0.0,
             "max_spread_pct": 999.0,
         },
-        # Fewer ideas, more tradable
         "execution": {
             "timeframe_select": "15minute",
             "rsi_period": 14,
@@ -246,7 +233,6 @@ def apply_preset(preset: str):
             "min_ltp": 20.0,
             "max_spread_pct": 4.0,
         },
-        # Safe baseline
         "reset": {
             "timeframe_select": "15minute",
             "rsi_period": 14,
@@ -274,64 +260,49 @@ def apply_preset(preset: str):
 
     _toast(f"Preset applied: {preset.title()}")
 
-    # Compatibility: Streamlit versions differ
     if hasattr(st, "rerun"):
         st.rerun()
     elif hasattr(st, "experimental_rerun"):
         st.experimental_rerun()
     else:
-        # Last resort: ask user to manually refresh if rerun isn't available
-        st.warning("Preset applied. Please refresh the page once to apply UI changes.")
+        st.warning("Preset applied. Please refresh once.")
 
 
 # =============================
 # STEP 5 — Scoring / Ranking
 # =============================
 def compute_idea_score(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds a Score column to help rank ideas.
-    Works even if some columns are missing.
-    """
     if df is None or df.empty:
         return df
 
     out = df.copy()
-
-    # Base = Action Confidence (if present)
     base = out["Action Confidence"].fillna(0) if "Action Confidence" in out.columns else 0
     out["Score"] = base.astype(float)
 
-    # Prefer selling (your style)
     if "Action" in out.columns:
         out.loc[out["Action"].isin(["SELL PUT", "SELL CALL"]), "Score"] += 5
         out.loc[out["Action"].isin(["BUY PUT", "BUY CALL"]), "Score"] -= 5
 
-    # OI Read quality (mean-reversion friendly)
     if "OI Read" in out.columns:
         out.loc[out["OI Read"].isin(["Long buildup", "Short covering"]), "Score"] += 3
         out.loc[out["OI Read"].isin(["Long unwinding", "Short buildup"]), "Score"] -= 2
 
-    # RSI sanity (avoid extremes)
     if "RSI" in out.columns:
         r = out["RSI"].fillna(0)
         out.loc[(r >= 55) & (r <= 68), "Score"] += 2
         out.loc[(r >= 70) | (r <= 35), "Score"] -= 2
 
-    # Penalize explicit conflicts if label includes it
     if "Trade Label" in out.columns:
         tl = out["Trade Label"].fillna("").astype(str)
         out.loc[tl.str.contains("ST conflict", case=False, na=False), "Score"] -= 8
         out.loc[tl.str.contains("Against SPOT trend", case=False, na=False), "Score"] -= 8
 
-    # Bonus: with-spot alignment (if available)
     if "SPOT Trend" in out.columns and "Action" in out.columns:
         spot = out["SPOT Trend"].fillna("Unknown").astype(str).str.title()
         act = out["Action"].fillna("").astype(str)
-
         out.loc[(act == "SELL PUT") & (spot == "Up"), "Score"] += 3
         out.loc[(act == "SELL CALL") & (spot == "Down"), "Score"] += 3
 
-    # Minor bonus: stronger OI move (if available)
     if "OI Δ" in out.columns:
         oid = out["OI Δ"].fillna(0).abs()
         out.loc[oid >= 100000, "Score"] += 1
@@ -352,13 +323,9 @@ st.caption(
 with st.expander("How to read these signals (CE/PE core logic)", expanded=False):
     st.markdown("""
 ### The 2-layer model
-
 Each strike is explained in **two layers**:
-
 1) **Momentum label**: Price Δ + OI Δ  
 2) **Trade label**: your premium-selling bias (BUY is rare)
-
-BUY signals should appear rarely by design.
 """)
 
 st.divider()
@@ -367,12 +334,10 @@ st.divider()
 # Login block
 # -----------------------------
 require_kite()
-
 kite_public = make_kite()
 login_url = kite_public.login_url()
 
 st.subheader("Login (required daily)")
-
 l1, l2 = st.columns([1.2, 2.0])
 
 with l1:
@@ -391,7 +356,6 @@ with l2:
             try:
                 session_data = kite_public.generate_session(request_token, api_secret=API_SECRET)
                 access_token = session_data.get("access_token")
-
                 if not access_token:
                     st.error("Access token not returned. Please re-login.")
                 else:
@@ -408,8 +372,15 @@ if not access_token:
     st.stop()
 
 kite = make_kite(access_token=access_token)
+trade_manager.init_trade_state(st)
 
-tab_scan, tab_summary = st.tabs(["Scanner", "Market / OI Summary"])
+tab_scan, tab_summary, tab_trades = st.tabs(["Scanner", "Market / OI Summary", "Open Trades / Square-off"])
+
+# show last action toast
+msg = st.session_state.pop("last_action_msg", None)
+if msg:
+    st.success(msg)
+
 
 # =============================
 # TAB 1: SCANNER
@@ -433,12 +404,11 @@ with tab_scan:
 
         st.caption("Use presets to switch between exploring ideas vs trading-only shortlists.")
 
-
         underlying = st.selectbox(
             "Underlying",
             options=["NIFTY", "BANKNIFTY", "FINNIFTY"],
             index=0,
-            key="underlying_select"
+            key="underlying_select",
         )
         st.caption("Ideal: pick the instrument you actually trade that day (avoid switching too often).")
 
@@ -454,86 +424,79 @@ with tab_scan:
                 options=expiries,
                 format_func=lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d),
                 index=0,
-                key="expiry_select"
+                key="expiry_select",
             )
             st.caption("Ideal: nearest weekly expiry for intraday; avoid far expiries unless you intend to trade them.")
 
         timeframe = st.selectbox(
             "Timeframe",
             options=["5minute", "15minute", "30minute", "60minute"],
-            index=1,
-            key="timeframe_select"
+            index=["5minute", "15minute", "30minute", "60minute"].index(st.session_state.get("timeframe_select", "15minute"))
+            if st.session_state.get("timeframe_select") in ["5minute", "15minute", "30minute", "60minute"] else 1,
+            key="timeframe_select",
         )
         st.caption("Ideal: 15m for stability. 5m for faster signals but more noise.")
 
-        rsi_period = st.number_input("RSI period", min_value=5, max_value=50, value=14, step=1, key="rsi_period")
+        rsi_period = st.number_input("RSI period", min_value=5, max_value=50, value=int(st.session_state.get("rsi_period", 14)), step=1, key="rsi_period")
         st.caption("Ideal: 14 (standard).")
 
         rsi_threshold = st.slider(
             "RSI threshold (idea filter)",
-            min_value=40, max_value=80, value=55,
-            key="rsi_threshold"
+            min_value=40, max_value=80,
+            value=int(st.session_state.get("rsi_threshold", 55)),
+            key="rsi_threshold",
         )
         st.caption("Ideal: 55 for discovery; 60–65 for execution-only filtering.")
 
         strict_rsi = st.checkbox(
             "Strict RSI filter (hide RSI below threshold)",
-            value=st.session_state.get("strict_rsi", False),
+            value=bool(st.session_state.get("strict_rsi", False)),
             key="strict_rsi",
-            help="ON = hard filter; OFF = soft idea filter."
+            help="ON = hard filter; OFF = soft idea filter.",
         )
         st.caption("Ideal: OFF (discovery). Turn ON only when you want a tight shortlist.")
 
-        st_period = st.number_input("Supertrend period", min_value=5, max_value=30, value=10, step=1, key="st_period")
+        st_period = st.number_input("Supertrend period", min_value=5, max_value=30, value=int(st.session_state.get("st_period", 10)), step=1, key="st_period")
         st.caption("Ideal: 10 for intraday trend gating.")
 
-        st_mult = st.number_input("Supertrend multiplier", min_value=1.0, max_value=5.0, value=3.0, step=0.5, key="st_mult")
+        st_mult = st.number_input("Supertrend multiplier", min_value=1.0, max_value=5.0, value=float(st.session_state.get("st_mult", 3.0)), step=0.5, key="st_mult")
         st.caption("Ideal: 3.0 (common). Lower = more signals; higher = fewer, cleaner signals.")
 
         st.markdown("### Strike Range")
-        use_atm_filter = st.checkbox("ATM ± X filter", value=True, key="use_atm_filter")
+        use_atm_filter = st.checkbox("ATM ± X filter", value=bool(st.session_state.get("use_atm_filter", True)), key="use_atm_filter")
         st.caption("Ideal: ON (keeps scan relevant; avoids deep OTM junk).")
 
-        atm_steps = st.number_input("X strike steps", min_value=1, max_value=50, value=15, step=1, key="atm_steps")
+        atm_steps = st.number_input("X strike steps", min_value=1, max_value=50, value=int(st.session_state.get("atm_steps", 15)), step=1, key="atm_steps")
         st.caption("Ideal: NIFTY 12–20, BANKNIFTY 15–25 depending on volatility.")
 
         st.markdown("### Confidence")
-        min_conf = st.slider("Minimum Action Confidence", min_value=0, max_value=100, value=35, key="min_conf")
+        min_conf = st.slider("Minimum Action Confidence", min_value=0, max_value=100, value=int(st.session_state.get("min_conf", 35)), key="min_conf")
         st.caption("Ideal: 30–40 discovery; 55–65 execution shortlist.")
 
         st.markdown("### Execution / Liquidity (Step 4)")
         enable_liquidity = st.checkbox(
             "Enable liquidity filters",
-            value=True,
+            value=bool(st.session_state.get("enable_liquidity", True)),
             key="enable_liquidity",
-            help="Filters illiquid strikes (low OI/volume, low LTP, wide spreads)."
+            help="Filters illiquid strikes (low OI/volume, low LTP, wide spreads).",
         )
-
-        min_oi = st.number_input("Min OI", min_value=0, value=10000, step=1000, key="min_oi")
-        min_volume = st.number_input("Min Volume", min_value=0, value=100, step=50, key="min_volume")
-        min_ltp = st.number_input("Min LTP", min_value=0.0, value=5.0, step=1.0, key="min_ltp")
-        max_spread_pct = st.number_input("Max spread %", min_value=0.0, value=8.0, step=0.5, key="max_spread_pct")
-        
         st.caption("Ideal: ON for real trading; OFF only for debugging/learning.")
 
-        min_oi = st.number_input("Min OI", min_value=0, value=10000, step=1000)
+        min_oi = st.number_input("Min OI", min_value=0, value=int(st.session_state.get("min_oi", 10000)), step=1000, key="min_oi")
         st.caption("Ideal: 10k–50k. Increase on expiry day; reduce for far expiries.")
 
-        min_volume = st.number_input("Min Volume", min_value=0, value=100, step=50)
+        min_volume = st.number_input("Min Volume", min_value=0, value=int(st.session_state.get("min_volume", 100)), step=50, key="min_volume")
         st.caption("Ideal: 100–1000. Increase after 10:00 AM when volume stabilizes.")
 
-        min_ltp = st.number_input("Min LTP", min_value=0.0, value=5.0, step=1.0)
+        min_ltp = st.number_input("Min LTP", min_value=0.0, value=float(st.session_state.get("min_ltp", 5.0)), step=1.0, key="min_ltp")
         st.caption("Ideal: 5–20. Increase if you want only tradable premiums with better fills.")
 
-        max_spread_pct = st.number_input("Max spread %", min_value=0.0, value=8.0, step=0.5)
+        max_spread_pct = st.number_input("Max spread %", min_value=0.0, value=float(st.session_state.get("max_spread_pct", 8.0)), step=0.5, key="max_spread_pct")
         st.caption("Ideal: 2–5% for execution quality. Use 6–10% if you’re only scouting.")
 
         st.markdown("### Debug")
         debug_show_strikes = st.checkbox("Debug: show included strikes", value=False, key="debug_show_strikes")
-        st.caption("Ideal: OFF (use only if you suspect ATM filter is too narrow).")
-
         debug_no_match_details = st.checkbox("Debug: show no-match diagnostics", value=False, key="debug_no_match_details")
-        st.caption("Ideal: ON only when you get zero results.")
 
     with right:
         st.subheader("Trade Ideas")
@@ -565,10 +528,8 @@ with tab_scan:
                     params = inspect.signature(fn).parameters
                     kwargs = {}
 
-                    if "kite" in params:
-                        kwargs["kite"] = kite
-                    if "underlying" in params:
-                        kwargs["underlying"] = underlying
+                    kwargs["kite"] = kite
+                    kwargs["underlying"] = underlying
 
                     expiry_str = None
                     if expiry is not None:
@@ -582,15 +543,15 @@ with tab_scan:
                     elif "expiry" in params:
                         kwargs["expiry"] = expiry_str
 
-                    if "timeframe" in params:
-                        kwargs["timeframe"] = timeframe
-                    elif "interval" in params:
+                    if "interval" in params:
                         kwargs["interval"] = timeframe
+                    elif "timeframe" in params:
+                        kwargs["timeframe"] = timeframe
 
                     if "rsi_period" in params:
                         kwargs["rsi_period"] = int(rsi_period)
                     if "rsi_threshold" in params:
-                        kwargs["rsi_threshold"] = int(rsi_threshold)
+                        kwargs["rsi_threshold"] = float(rsi_threshold)
 
                     if "st_period" in params:
                         kwargs["st_period"] = int(st_period)
@@ -602,7 +563,6 @@ with tab_scan:
                     if "atm_steps" in params:
                         kwargs["atm_steps"] = int(atm_steps)
 
-                    # Step 4 liquidity params (pass only if scanner supports)
                     if enable_liquidity:
                         if "min_oi" in params:
                             kwargs["min_oi"] = int(min_oi)
@@ -625,29 +585,28 @@ with tab_scan:
                     results_df = fn(**kwargs)
 
             scan_placeholder.empty()
-
         except Exception as e:
             scan_placeholder.empty()
             st.error(f"Scan failed: {e}")
             results_df = None
 
     with results_area:
+        # If not running now, reuse last scan
+        if (not run) and ("last_scan_df" in st.session_state):
+            results_df = st.session_state["last_scan_df"].copy()
+
         if isinstance(results_df, pd.DataFrame):
             raw_df = results_df.copy()
 
-            # UI confidence filter
+            # confidence filter
             if not results_df.empty and "Action Confidence" in results_df.columns:
-                after_conf_df = results_df[
-                    results_df["Action Confidence"].fillna(0) >= int(min_conf)
-                ].copy()
+                after_conf_df = results_df[results_df["Action Confidence"].fillna(0) >= int(min_conf)].copy()
             else:
                 after_conf_df = results_df.copy()
 
-            # UI strict RSI filter
+            # strict RSI filter
             if not after_conf_df.empty and strict_rsi and "RSI" in after_conf_df.columns:
-                after_rsi_df = after_conf_df[
-                    after_conf_df["RSI"].fillna(0) >= int(rsi_threshold)
-                ].copy()
+                after_rsi_df = after_conf_df[after_conf_df["RSI"].fillna(0) >= float(rsi_threshold)].copy()
             else:
                 after_rsi_df = after_conf_df.copy()
 
@@ -663,16 +622,14 @@ with tab_scan:
                         "Scanner returned 0 rows. Likely causes: ATM range too narrow, "
                         "liquidity filters too strict, or candle/quote availability issues."
                     )
-
                 if debug_no_match_details:
-                    st.info(
-                        "Try: raise ATM steps, lower min_conf, lower RSI threshold, "
-                        "or temporarily disable liquidity filters."
-                    )
+                    st.info("Try: raise ATM steps, lower min_conf, lower RSI threshold, or disable liquidity filters.")
             else:
-                # STEP 5: add Score + show Top Ideas
                 results_scored = compute_idea_score(results_df)
                 results_scored = results_scored.sort_values(["Score", "Action Confidence"], ascending=[False, False])
+
+                # persist scored scan for reruns + other tabs
+                st.session_state["last_scan_df"] = results_scored.copy()
 
                 with st.expander("Top Ranked Ideas (Step 5)", expanded=True):
                     st.caption(
@@ -680,25 +637,99 @@ with tab_scan:
                         "+ small bonuses/penalties from labels. Use this as a shortlist, not as auto-trade."
                     )
 
-                    top_n = st.number_input("Show Top N", min_value=5, max_value=50, value=10, step=1)
-                    prefer_sells = st.checkbox("Show only SELL actions", value=True)
+                    top_n = st.number_input("Show Top N", min_value=5, max_value=50, value=10, step=1, key="top_n")
+                    prefer_sells = st.checkbox("Show only SELL actions", value=True, key="prefer_sells")
 
                     view = results_scored.copy()
                     if prefer_sells and "Action" in view.columns:
                         view = view[view["Action"].isin(["SELL PUT", "SELL CALL"])].copy()
 
-                    top = view.head(int(top_n))
+                    top = view.head(int(top_n)).copy()
 
                     preferred_cols = [
                         "Score", "Action", "Action Confidence",
                         "Trade Label", "Momentum Label",
                         "Strike", "Type", "RSI", "ST Trend", "SPOT Trend",
-                        "Price Δ", "OI Δ", "OI Read", "Symbol"
+                        "Price Δ", "OI Δ", "OI Read", "Symbol",
+                        "instrument_token", "LTP"
                     ]
                     cols = [c for c in preferred_cols if c in top.columns]
                     st.dataframe(top[cols], use_container_width=True, hide_index=True)
 
-                # Mini counters
+                    # persist top list too (optional)
+                    st.session_state["last_top_df"] = top.copy()
+
+                    # -----------------------------
+                    # STEP 7: One-click Add Trade (FORM)
+                    # -----------------------------
+                    st.markdown("### ➕ Add selected strike to Open Trades (Step 7)")
+                    st.caption("Recommend-only: this does NOT place orders. It just adds to the Open Trades tab.")
+
+                    required_cols = {"Symbol", "instrument_token"}
+                    if top.empty:
+                        st.info("Top list is empty after filters. Change Top N / SELL-only filter.")
+                    elif not required_cols.issubset(set(top.columns)):
+                        st.error("Top table missing required columns. Ensure scanner returns Symbol + instrument_token.")
+                    else:
+                        def _label(r: dict) -> str:
+                            return f"{r.get('Symbol')} | {r.get('Action','')} | Strike {r.get('Strike','')} | Score {r.get('Score','')}"
+
+                        options = top.to_dict("records")
+
+                        with st.form("add_trade_form", clear_on_submit=False):
+                            pick = st.selectbox(
+                                "Pick strike to add",
+                                options=options,
+                                format_func=_label,
+                                key="add_trade_pick_form",
+                            )
+
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                entry_price = st.number_input(
+                                    "Entry premium (your fill)",
+                                    min_value=0.0,
+                                    step=0.5,
+                                    value=float(pick.get("LTP", 0) or 0),
+                                    key="add_trade_entry_form",
+                                )
+                            with c2:
+                                qty = st.number_input(
+                                    "Quantity",
+                                    min_value=1,
+                                    value=15,
+                                    step=1,
+                                    key="add_trade_qty_form",
+                                )
+                            with c3:
+                                submitted = st.form_submit_button("Add Trade")
+
+                            if submitted:
+                                action = str(pick.get("Action", "")).upper()
+                                side = "SELL" if action.startswith("SELL") else "BUY"
+
+                                try:
+                                    trade_manager.add_trade(
+                                        st,
+                                        {
+                                            "symbol": str(pick["Symbol"]),
+                                            "instrument_token": int(pick["instrument_token"]),
+                                            "side": side,
+                                            "qty": int(qty),
+                                            "entry_price": float(entry_price),
+                                            "sl_pct": 30.0,
+                                            "tp_pct": 40.0,
+                                            "max_hold_minutes": 120,
+                                            "square_off_time": dt.time(15, 15),
+                                            "note": f"From scanner | {pick.get('Trade Label','')}",
+                                        }
+                                    )
+                                    st.session_state["last_action_msg"] = f"Trade added: {pick['Symbol']} ({side})"
+                                    st.success(f"Trade added: {pick['Symbol']} ({side})")
+                                except Exception as e:
+                                    st.error(f"Failed to add trade: {e}")
+
+                # counters
                 action_counts = results_scored["Action"].value_counts().to_dict() if "Action" in results_scored.columns else {}
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("BUY CALL", action_counts.get("BUY CALL", 0))
@@ -718,11 +749,11 @@ with tab_scan:
                     st.caption(f"Filtered scan strikes ({len(strikes)}):")
                     st.write(strikes)
 
-                # Full table
+                # full table
                 preferred = [
                     "Score", "Action", "Action Confidence", "Trade Label", "Momentum Label",
                     "Strike", "Type", "RSI", "ST Trend", "SPOT Trend",
-                    "Price Δ", "OI Δ", "OI Read", "Symbol"
+                    "Price Δ", "OI Δ", "OI Read", "Symbol", "instrument_token", "LTP"
                 ]
                 cols = [c for c in preferred if c in results_scored.columns]
                 remaining = [c for c in results_scored.columns if c not in cols]
@@ -736,7 +767,7 @@ with tab_scan:
                     file_name=f"{underlying}_options_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                     use_container_width=True,
-                    key="download_csv_btn"
+                    key="download_csv_btn",
                 )
         else:
             st.caption("Ready. Click **Run Scan**.")
@@ -750,9 +781,9 @@ with tab_summary:
 
     expiry_str = None
     try:
-        expiry_str = expiry.strftime("%Y-%m-%d") if expiry is not None else None
+        expiry_str = expiry.strftime("%Y-%m-%d") if "expiry" in locals() and expiry is not None else None
     except Exception:
-        expiry_str = str(expiry) if expiry is not None else None
+        expiry_str = str(expiry) if "expiry" in locals() and expiry is not None else None
 
     detected_spot = spot if "spot" in locals() else None
 
@@ -793,26 +824,176 @@ with tab_summary:
             )
 
             with st.expander("Show raw option-chain snapshot (full chain for this expiry)"):
-                st.dataframe(
-                    full_chain_df.sort_values(["type", "strike"]),
-                    use_container_width=True,
-                    height=400,
-                )
+                st.dataframe(full_chain_df.sort_values(["type", "strike"]), use_container_width=True, height=400)
 
     st.markdown("### 3️⃣ Intraday Option-Selling Structures")
-    st.markdown(
-        """
-**Sample structures using OI clusters** (you still confirm with live data):
+    st.markdown("""
+- **Setup A — Short Call at Resistance**
+- **Setup B — Short Strangle / Iron Condor (Range-bound)**
+- **Setup C — Short Put near Support**
+""")
 
-- **Setup A — Short Call at Resistance**  
-  Sell OTM CE at or just below the highest CE OI strike when price struggles below that zone.
 
-- **Setup B — Short Strangle / Iron Condor (Range-bound view)**  
-  Sell CE at upper OI cluster + PE at lower OI cluster when price trades in the middle and PCR ≈ 1.
+# =============================
+# TAB 3: OPEN TRADES / SQUARE-OFF
+# =============================
+with tab_trades:
+    st.subheader("Open Trades / Square-off Recommendations")
+    st.caption("Recommend-only. No orders are placed.")
 
-- **Setup C — Short Put near Support**  
-  Sell OTM PE at strongest PE OI strike when price bounces from lower levels and PCR > 1.
+    auto_refresh = st.checkbox("Auto-refresh (every 30s)", value=False)
+    if auto_refresh:
+        st.info("Auto-refresh is ON. The app will refresh every ~30 seconds while this tab is open.")
 
-Always confirm with intraday price action, IV behaviour, and strict risk management.
-        """
-    )
+    with st.expander("➕ Add a trade (manual)", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            t_symbol = st.text_input("Option Symbol (tradingsymbol)", value="")
+        with c2:
+            t_token = st.number_input("Instrument Token", min_value=0, value=0, step=1)
+        with c3:
+            t_side = st.selectbox("Side", options=["SELL", "BUY"], index=0)
+        with c4:
+            t_qty = st.number_input("Quantity", min_value=1, value=15, step=1)
+
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            t_entry = st.number_input("Entry Premium", min_value=0.0, value=100.0, step=0.5)
+        with c6:
+            t_sl = st.number_input("SL %", min_value=1.0, value=30.0, step=1.0)
+        with c7:
+            t_tp = st.number_input("Target %", min_value=1.0, value=40.0, step=1.0)
+        with c8:
+            t_max_hold = st.number_input("Max hold (mins)", min_value=5, value=120, step=5)
+
+        c9, c10 = st.columns(2)
+        with c9:
+            sq_time_str = st.text_input("Square-off time (HH:MM)", value="15:15")
+        with c10:
+            t_note = st.text_input("Notes (optional)", value="")
+
+        add_clicked = st.button("Add Trade", type="primary", use_container_width=True)
+
+        if add_clicked:
+            try:
+                if not t_symbol.strip():
+                    st.error("Please enter Option Symbol.")
+                elif int(t_token) <= 0:
+                    st.error("Please enter a valid instrument token.")
+                else:
+                    hh, mm = [int(x) for x in sq_time_str.strip().split(":")]
+                    sq_time = dt.time(hour=hh, minute=mm)
+
+                    trade_manager.add_trade(
+                        st,
+                        {
+                            "symbol": t_symbol.strip(),
+                            "instrument_token": int(t_token),
+                            "side": t_side,
+                            "qty": int(t_qty),
+                            "entry_price": float(t_entry),
+                            "sl_pct": float(t_sl),
+                            "tp_pct": float(t_tp),
+                            "max_hold_minutes": float(t_max_hold),
+                            "square_off_time": sq_time,
+                            "note": t_note.strip(),
+                        }
+                    )
+                    st.success("Trade added.")
+            except Exception as e:
+                st.error(f"Failed to add trade: {e}")
+
+    st.divider()
+
+    open_trades = [t for t in st.session_state.get("open_trades", []) if t.get("status") == "OPEN"]
+    if not open_trades:
+        st.info("No open trades yet. Add one above or from Scanner (Step 7).")
+    else:
+        rows = []
+        now = dt.datetime.now()
+
+        for t in open_trades:
+            token = int(t["instrument_token"])
+            ltp = trade_manager.safe_ltp_by_token(kite, token) or 0.0
+
+            spot_tr = "Unknown"
+            opt_tr = "Unknown"
+            oi_read = "Neutral"
+
+            try:
+                spot_tr = scanner.get_spot_trend(kite, underlying, interval="15minute", lookback_days=5, st_period=10, st_mult=3.0)
+            except Exception:
+                spot_tr = "Unknown"
+
+            try:
+                candles = kite.historical_data(token, now - dt.timedelta(days=5), now, "15minute", oi=False)
+                if candles:
+                    dfc = pd.DataFrame(candles)
+                    from indicators import compute_supertrend
+                    opt_tr = compute_supertrend(dfc, period=10, multiplier=3.0)
+            except Exception:
+                opt_tr = "Unknown"
+
+            action, confidence, reasons = trade_manager.recommend_square_off(
+                trade=t,
+                ltp=float(ltp),
+                spot_trend=spot_tr,
+                option_trend=opt_tr,
+                oi_read=oi_read,
+                now=now,
+            )
+
+            entry = float(t["entry_price"])
+            side = str(t["side"]).upper()
+            qty = int(t["qty"])
+
+            pnl_points = (entry - ltp) if side == "SELL" else (ltp - entry)
+            pnl = pnl_points * qty
+
+            hold_mins = (now - t["entry_time"]).total_seconds() / 60.0 if isinstance(t.get("entry_time"), dt.datetime) else None
+
+            rows.append({
+                "Trade ID": t["trade_id"],
+                "Symbol": t["symbol"],
+                "Side": side,
+                "Qty": qty,
+                "Entry": round(entry, 2),
+                "LTP": round(float(ltp), 2),
+                "PnL (approx)": round(float(pnl), 2),
+                "Hold (mins)": round(hold_mins, 1) if hold_mins is not None else None,
+                "Recommendation": action,
+                "Confidence": int(confidence),
+                "Reasons": "; ".join(reasons) if reasons else "",
+                "Partial Done": bool(t.get("partial_done", False)),
+                "Note": t.get("note", ""),
+            })
+
+        df = pd.DataFrame(rows).sort_values(["Confidence"], ascending=False)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.markdown("### Actions (recommend-only)")
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            tid_partial = st.text_input("Trade ID for Partial Done", value="", key="tid_partial")
+            if st.button("Mark Partial Done (50%)", use_container_width=True):
+                ok = trade_manager.mark_partial_done(st, tid_partial.strip())
+                st.success("Marked partial done.") if ok else st.error("Trade ID not found.")
+
+        with c2:
+            tid_exit = st.text_input("Trade ID to mark exited", value="", key="tid_exit")
+            if st.button("Mark Exited", use_container_width=True):
+                ok = trade_manager.mark_exited(st, tid_exit.strip())
+                st.success("Marked exited.") if ok else st.error("Trade ID not found.")
+
+        with c3:
+            if st.button("Remove all EXITED trades", use_container_width=True):
+                trade_manager.purge_exited(st)
+                st.success("Purged exited trades.")
+
+    if auto_refresh:
+        if hasattr(st, "rerun"):
+            st.rerun()
+        elif hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()

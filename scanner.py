@@ -567,19 +567,22 @@ def scan_options_with_indicators(
         strike = float(c["Strike"])
         opt_type = c["Type"]
 
+        # ✅ USE BATCHED QUOTES
         quote = quotes_map.get(str(token)) or quotes_map.get(token)
         if not quote:
             continue
 
-        # Step 3: liquidity gate
+        # STEP 3: Liquidity gate
         if not _passes_liquidity_filters(
             quote=quote,
-            min_oi=int(min_oi),
-            min_volume=int(min_volume),
-            max_spread_pct=float(max_spread_pct),
-            min_ltp=float(min_ltp),
+            min_oi=min_oi,
+            min_volume=min_volume,
+            max_spread_pct=max_spread_pct,
+            min_ltp=min_ltp,
         ):
             continue
+
+        ltp = float(quote.get("last_price", 0) or 0)
 
         ohlc = _fetch_ohlc(kite, token, interval, lookback_days)
         if ohlc.empty or len(ohlc) < 3:
@@ -588,7 +591,11 @@ def scan_options_with_indicators(
         price_delta, oi_delta = _compute_price_oi_delta(ohlc)
 
         rsi_val = compute_rsi(ohlc, period=int(rsi_period))
-        st_dir = compute_supertrend(ohlc, period=int(st_period), multiplier=float(st_mult))
+        st_dir = compute_supertrend(
+            ohlc,
+            period=int(st_period),
+            multiplier=float(st_mult),
+        )
 
         cls = classify_action_two_layer(
             opt_type=opt_type,
@@ -603,6 +610,8 @@ def scan_options_with_indicators(
         rows.append(
             {
                 "Symbol": sym,
+                "instrument_token": token,   # ✅ Step 7 FIX
+                "LTP": round(ltp, 2),        # ✅ Entry default
                 "Strike": int(strike) if strike.is_integer() else strike,
                 "Type": opt_type,
                 "ST Trend": st_dir,
@@ -615,10 +624,6 @@ def scan_options_with_indicators(
                 "Trade Label": cls["Trade Label"],
                 "Action": cls["Action"],
                 "Action Confidence": cls["Action Confidence"],
-                # Optional: expose execution metrics for debugging
-                "LTP": float(quote.get("last_price", 0) or 0),
-                "VOL": float(quote.get("volume", 0) or 0),
-                "OI": float(quote.get("oi", 0) or 0),
             }
         )
 
