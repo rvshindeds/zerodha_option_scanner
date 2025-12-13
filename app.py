@@ -910,21 +910,60 @@ with tab_trades:
     if not open_trades:
         st.info("No open trades yet. Add one above or from Scanner (Step 7).")
     else:
+
         rows = []
         now = dt.datetime.now()
 
+        # -----------------------------
+        # FAST: batch-quote all trade tokens once
+        # -----------------------------
+        tokens = []
+        for _t in open_trades:
+            try:
+                tok = int(_t.get("instrument_token", 0) or 0)
+                if tok > 0:
+                    tokens.append(tok)
+            except Exception:
+                pass
+
+        ltp_map = {}
+        try:
+            if tokens:
+                q = kite.quote(tokens)  # single API call
+                for tok in tokens:
+                    data = q.get(str(tok)) or q.get(tok) or {}
+                    lp = data.get("last_price")
+                    if lp is not None:
+                        ltp_map[tok] = float(lp)
+        except Exception:
+            ltp_map = {}
+
+        # -----------------------------
+        # FAST: compute SPOT trend once per refresh
+        # -----------------------------
+        try:
+            spot_tr_global = scanner.get_spot_trend(
+                kite, underlying,
+                interval="15minute",
+                lookback_days=5,
+                st_period=10,
+                st_mult=3.0
+            )
+        except Exception:
+            spot_tr_global = "Unknown"
+
         for t in open_trades:
             token = int(t["instrument_token"])
-            ltp = trade_manager.safe_ltp_by_token(kite, token) or 0.0
 
-            spot_tr = "Unknown"
+            # Use batch LTP; fallback to per-token if missing
+            ltp = ltp_map.get(token)
+            if ltp is None:
+                ltp = trade_manager.safe_ltp_by_token(kite, token) or 0.0
+
+            spot_tr = spot_tr_global
             opt_tr = "Unknown"
             oi_read = "Neutral"
 
-            try:
-                spot_tr = scanner.get_spot_trend(kite, underlying, interval="15minute", lookback_days=5, st_period=10, st_mult=3.0)
-            except Exception:
-                spot_tr = "Unknown"
 
             try:
                 candles = kite.historical_data(token, now - dt.timedelta(days=5), now, "15minute", oi=False)
@@ -951,6 +990,17 @@ with tab_trades:
             pnl_points = (entry - ltp) if side == "SELL" else (ltp - entry)
             pnl = pnl_points * qty
 
+            pnl_pct = (pnl_points / entry * 100.0) if entry else 0.0
+            
+            mins_left = None
+            sq_time = t.get("square_off_time")
+            if isinstance(sq_time, dt.time):
+                try:
+                    sq_dt = dt.datetime.combine(now.date(), sq_time)
+                    mins_left = max(0.0, (sq_dt - now).total_seconds() / 60.0)
+                except Exception:
+                    mins_left = None
+
             hold_mins = (now - t["entry_time"]).total_seconds() / 60.0 if isinstance(t.get("entry_time"), dt.datetime) else None
 
             rows.append({
@@ -961,6 +1011,8 @@ with tab_trades:
                 "Entry": round(entry, 2),
                 "LTP": round(float(ltp), 2),
                 "PnL (approx)": round(float(pnl), 2),
+                "PnL %": round(float(pnl_pct), 2),
+                "Mins left (SqOff)": round(mins_left, 1) if mins_left is not None else None,
                 "Hold (mins)": round(hold_mins, 1) if hold_mins is not None else None,
                 "Recommendation": action,
                 "Confidence": int(confidence),
@@ -979,13 +1031,19 @@ with tab_trades:
             tid_partial = st.text_input("Trade ID for Partial Done", value="", key="tid_partial")
             if st.button("Mark Partial Done (50%)", use_container_width=True):
                 ok = trade_manager.mark_partial_done(st, tid_partial.strip())
-                st.success("Marked partial done.") if ok else st.error("Trade ID not found.")
+                if ok:
+                    st.success("Marked partial done.")
+                else:
+                    st.error("Trade ID not found.")
 
         with c2:
             tid_exit = st.text_input("Trade ID to mark exited", value="", key="tid_exit")
             if st.button("Mark Exited", use_container_width=True):
                 ok = trade_manager.mark_exited(st, tid_exit.strip())
-                st.success("Marked exited.") if ok else st.error("Trade ID not found.")
+                if ok:
+                    st.success("Marked exited.")
+                else:
+                    st.error("Trade ID not found.")
 
         with c3:
             if st.button("Remove all EXITED trades", use_container_width=True):
